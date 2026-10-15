@@ -10,7 +10,31 @@
 
 **Spec:** 本文件第 2—8 节是完整需求和设计；第 9—10 节是实施及验收计划。无需阅读旧对话即可接手。
 
-**日期：** 2026-10-15（Asia/Shanghai）。**状态：** Task 1 纯逻辑和 Task 2 浏览器实现已完成；真实站点闭环仍须单独验收；Task 3—5 尚未实施。以下历史记录保留原阶段结论，当前接口以最新记录为准。
+**日期：** 2026-10-15（Asia/Shanghai）。**状态：** Task 1—3 实现及本地/替身验证已完成；真实 ChatGPT 和 QQ 仍须单独验收；Task 4—5 尚未实施。以下历史记录保留原阶段结论，当前接口以最新记录为准。
+
+### 2026-10-15 Task 3 实施记录（当前接口与授权）
+
+按用户要求先提交并推送一次 Task 2：`67181db` 已推送至 origin/main，仓库可见性未变。随后只修改 messaging.py、对应单元测试及文档；不再次提交或推送 Task 3，不发真实 QQ，不修改 browser_chat.py、scheduler.py 或其测试行为。没有新增依赖。
+
+当前接口（暂无 main.py 调用方需要迁移）：
+
+- `OneBotBinding(platform_id, self_id, client, sender_name="BrowserChat")`，推荐 `OneBotBinding.from_event(event)` 从公开 getter 和 event.bot 构造，存入 SourceRoute.send_handle。严格核对来源实例、有效目标及 group/private；每次 call_action 注入原 self_id。不会保留 AstrBot event。
+- `await send_answer(route, parts, *, timeout_s=30) -> DeliveryResult`。群/私聊分别调用 send_group_forward_msg/send_private_forward_msg；节点使用机器人 uin、署名及纯 text 段。仅明确失败后普通消息有限降级一次；共享总超时，不重试已确认段或未知发送。
+- `DeliveryResult(status, confirmed_parts, total_parts, used_fallback, uncertain, reason)` 为不可变元数据，不含正文；status 为 confirmed/partial/unknown/failed。partial 区分已确认段数及失败段不确定性。confirmed 仅为 API 接受，不能宣称用户已读或客户端最终展示。
+- `DeliveryCancelled(Exception).result` 保留取消进度。Python 3.10 跨 Task 会丢失 CancelledError 子类自定义字段，故这里用普通异常传输；Task 4 必须捕获、记录 result 后重新抛 asyncio.CancelledError。发送前取消不提交；在途取消标 uncertain，停止未提交段。
+- `Fault(task_id, source, category, reason="", browser_account_scope="default", occurred_at=UTC now)` 只传元数据，source 为 SourceRoute 或 None（启动故障）。reason 为控制码，任意原始错误丢弃；模板字段只从固定码映射和受限 ID构造，日志不输出原异常、Cookie、Token、路径、问题或答案。摘要保留首条发生时间。
+- `validate_template(template) -> str` 拒绝未知字段、属性/下标、转换及非空格式说明；仅允许 task_id/reason/category/source/time/count。`render_failure(fault, *, template=None, admin=False, count=1) -> str` 在模板无效时记录配置警告、使用安全默认文案；替换值不允许注入换行/CQ 段。
+- `await send_failure(route, fault, *, template=None, timeout_s=30) -> DeliveryResult` 给来源用户发一次普通提示；用户模板取任务准入配置快照，不在失败时自动调用通知。
+- `FailureNotifier(bindings, admin_ids, *, admin_failure_template=...)` 复制配置、去重管理员；`await notifier.notify_failure(platform_id, fault)` 使用精确来源 binding。按 `(platform_id, browser_account_scope, category)` 合并 300 秒，首发立即，后续累计，窗口末有新增才补总次数摘要。通知异常/False/未知只安全记录，不递归、不重试；空列表警告，错平台不兜底。
+- `await notifier.close()` 取消并等待自己所有计时器和发送；通知层恢复正常 CancelledError 语义，不发卸载汇总。构造可注入 window_sleep，仅用于受控窗口测试，默认 asyncio.sleep(300)，不是面板配置。
+
+当前安装源码核验：AiocqhttpMessageEvent.send/send_message 丢弃 OneBot 数据、成功返回 None；Context.send_message bool 仅代表找到平台。为避免混淆，本模块使用原始 CQHttp.call_action。已安装 aiocqhttp 的 `_handle_api_result` 在明确失败时抛 ActionFailed，成功时解包 data。ActionFailed、ApiNotAvailable、显式 failed 响应才按拒绝；原始 None/False/连接异常/超时/async 或未知响应按 unknown，不全文降级。没有调用 event.send 或 Context.send_message 后再按真假重发的路径。
+
+Task 4 接入：生成成功后用 split_answer 再 send_answer；confirmed 映射 SUCCESS；unknown 或 partial 且 uncertain 映射 DELIVERY_UNKNOWN；明确 failed/partial 按失败处理并保留 confirmed_parts。取消先记录 DeliveryCancelled.result，传播取消后 finally 清理；不可根据取消承诺撤回已提交消息。管理员由 notifier.notify_failure 处理，权限/队满/空输入只提示用户；启动故障由入口显式枚举已启用 OneBot 来源。terminate 调用 notifier.close，不留后台通知任务。
+
+单次只读复核发现通知取消时普通 DeliveryCancelled 外泄，已用阻塞发送的 cancel/close 测试复现并修正：通知层安全记录后恢复 CancelledError。其余未发现确定的 P1/P2。按额度要求只跑必要消息、调度回归和静态检查，不重跑浏览器或第二套环境。
+
+**最终验证：** venv Python 3.10.6 下 messaging 49 项全部通过（1.466 秒，包括已安装 aiocqhttp 的实际 ActionFailed 和 data 解包语义，未跳过）；scheduler 在 -S 标准库环境下 15 项通过（1.378 秒），合计本轮必要回归 64 项通过。Ruff check/format、py_compile、git diff --check 通过；浏览器、调度器及其测试相对 67181db 无差异。网络与 QQ 发送均由替身隔离；没有真实 QQ、宿主加载或浏览器回归验收。Task 3 当前修改未提交/推送，后续 Task 4 需按以上契约接入 main.py。
 
 ### 2026-10-15 Task 2 实施记录（当前接口与授权）
 
@@ -275,7 +299,7 @@ runner 包含完整执行、投递和有界 finally 清理；进入清理前显�
 - `TaskManager(concurrency, capacity, queue_timeout_s, runner)`；`async start() -> None`、`async submit(job: Job) -> Admission`、`async cancel(user_key) -> bool`、`async pause(reason) -> None`、`async resume() -> None`、`snapshot() -> QueueStatus`、`async close() -> None`。runner 为 `async (Job) -> None`，完整覆盖执行、发送和清理；QueueStatus 只含状态、计数及暂停原因，不含其他用户正文。构造不启动任务，initialize 调用 start；start/close 幂等。
 - pause 关闭准入、终止等待任务并请求执行任务安全退出；从 runner 内报告故障时不能等待或取消自身而造成死锁，当前 runner 继续走 finally 清理。resume 仅在浏览器检查 READY 且旧任务退出清理后开放准入；close 负责等待退出。管理员命令经 main.py 协调浏览器与调度器，不能只切换一个 ready 标志。
 - `browser_chat.py`：`ChatGPTBrowser.start()`、`ask(task_id, prompt, timeout_s, *, keep=False) -> BrowserAnswer`、`cleanup(task_id, keep=None) -> CleanupResult`、`resume(*, account_settings_verified=False) -> BrowserStatus`、`close()` 均为 async。keep 在 ask 前持久化，cleanup 不覆盖原策略；人工账号设置核验才可传 True。`BrowserAnswer` 含 text、conversation_id；异常分类不混入答案文本。失败时归属记录仍可用于 cleanup。BrowserStatus 包含 STARTING、READY、PAUSED、STOPPING，PAUSED 另带 login/challenge/rate_limit/browser/cleanup/config 原因；启动不会自动把未登录状态视为 READY。
-- `messaging.py`：`check_access(sender_id, group_id, config) -> bool`、`extract_prompt(event, max_input_chars) -> str`、`split_answer(text, total_limit, node_limit) -> list[str]`；`async send_answer(route, parts) -> DeliveryResult` 返回 confirmed/partial/unknown/failed 及确认段数，confirmed 只表示接口确认接受。`async notify_failure(platform_id, fault) -> None` 内部处理合并及通知失败。管理命令另在 main.py 校验管理员身份。
+- `messaging.py`：`check_access(sender_id, group_id, config) -> bool`、`extract_prompt(event, max_input_chars) -> str`、`split_answer(text, total_limit, node_limit) -> list[str]`；`async send_answer(route, parts, *, timeout_s=30) -> DeliveryResult` 返回 confirmed/partial/unknown/failed、确认段数和 uncertain，confirmed 只表示接口确认接受。SourceRoute.send_handle 使用 OneBotBinding。`async send_failure(route, fault, *, template=None, timeout_s=30)` 为用户提示；`FailureNotifier.notify_failure(platform_id, fault)` 处理管理员合并通知，terminate 调用 close。DeliveryCancelled.result 先记录再传播取消。管理命令另在 main.py 校验管理员身份。
 - 模块之间只传必要数据和回调；不为单一站点提前构建多 Provider 注册器、通用任务总线或数据库。来源路由保存 platform_id、会话类型、目标 ID及必要发送句柄，不持久化整个事件对象。
 
 ## 8. 当前宿主证据与开发时核查入口
@@ -361,10 +385,10 @@ runner 包含完整执行、投递和有界 finally 清理；进入清理前显�
 
 **接口：** 完成 `send_answer`、DeliveryResult、`notify_failure`；接收来源路由和文本节点，不重新调用模型。
 
-- [ ] 模拟群/私聊转发请求，检查路由、机器人署名和节点文本。
-- [ ] 测试转发明确拒绝时只降级一次；超时则 unknown 且不降级；普通消息发到中途失败时不重发已确认节点。
-- [ ] 测试多管理员、来源平台错配、返回 False、私信异常、首条立即通知及 300 秒内合并，通知异常不能递归。
-- [ ] 模板测试覆盖未知占位符、属性访问、换行注入和错误脱敏；用户与管理员文案分开。
+- [x] 模拟群/私聊转发请求，检查路由、机器人署名和节点文本。
+- [x] 测试转发明确拒绝时只降级一次；超时则 unknown 且不降级；普通消息发到中途失败时不重发已确认节点。
+- [x] 测试多管理员、来源平台错配、返回 False、私信异常、首条立即通知及 300 秒内合并，通知异常不能递归。
+- [x] 模板测试覆盖未知占位符、属性访问、换行注入和错误脱敏；用户与管理员文案分开。
 
 **完成条件：** 模拟发送边界通过；真实 QQ 转发和管理员私信由 Task 5 核验。
 

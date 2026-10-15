@@ -2,9 +2,34 @@
 
 计划通过专用浏览器操作 ChatGPT 网页，将文字回答返回 QQ 的 AstrBot 插件。后续考虑 Gemini 和 DeepSeek 适配。
 
-**当前状态：已实现 Task 1 纯逻辑及 Task 2 浏览器问答、清理和恢复。本地可控页面与真实 ChatGPT 验收分别记录；真实登录此前受阻，尚无插件入口，暂不可作为完整插件使用，未进行 QQ 测试或市场提交。**
+**当前状态：已实现 Task 1 纯逻辑、Task 2 浏览器模块及 Task 3 发送通知模块。浏览器用本地页面验证，发送用 OneBot 替身验证；真实 ChatGPT 闭环及 QQ 验收未通过，尚无插件入口，暂不可作为完整插件使用。**
 
-开发前阅读 [AGENTS.md](AGENTS.md) 和 [完整方案与开发交接](docs/superpowers/plans/2026-10-15-browser-chat-handoff.md)。本次仅实施 Task 2，不修改 QQ 发送与调度行为。
+开发前阅读 [AGENTS.md](AGENTS.md) 和 [完整方案与开发交接](docs/superpowers/plans/2026-10-15-browser-chat-handoff.md)。本次仅实施 Task 3，不修改浏览器与调度行为，不发送真实 QQ 消息。
+
+## Task 3 发送与通知接口
+
+- `OneBotBinding.from_event(event)` 捕获来源 aiocqhttp 实例 ID、机器人 QQ ID及原始客户端，放入 `SourceRoute.send_handle`。仅接受匹配的 platform_id、group/private 和有效目标 ID；每个请求携带原机器人 self_id，不能拿其他平台兜底。
+- `await send_answer(route, parts, *, timeout_s=30) -> DeliveryResult`：parts 使用 split_answer 的输出。群/私聊均先发一条合并转发，只有明确拒绝后才进行一次普通分段发送；整个流程共享 30 秒预算。不确定时不降级，部分成功后不重发任何已确认节点。
+- `DeliveryResult` 不含正文，字段为 status、confirmed_parts、total_parts、used_fallback、uncertain、reason。status 为 confirmed/partial/unknown/failed；partial 的 uncertain 标记当前失败段是否可能已发送。confirmed 仅表示接口接受，不表示 QQ 客户端已展示。
+- `DeliveryCancelled.result` 保存取消时的进度。由于 Python 3.10 跨任务等待会丢失 CancelledError 子类字段，该类型是普通异常；main.py 必须先记录 result，再重新抛 `asyncio.CancelledError`，不得把它当普通可重试故障。
+- `Fault(task_id, source, category, reason="", browser_account_scope="default", occurred_at=...)` 仅传故障元数据，reason 使用固定错误码；任意异常文本、页面内容和正文均不会进入渲染。occurred_at 默认 UTC发生时间，窗口汇总保留首条时间。
+- `validate_template(template)` 校验六个简单占位符 task_id/reason/category/source/time/count；属性、下标、转换和非空格式说明均拒绝。`render_failure(fault, *, template=None, admin=False, count=1)` 对无效模板记录配置警告并使用默认安全文案，替换字段不能注入换行或 CQ 码。
+- `await send_failure(route, fault, *, template=None, timeout_s=30)` 只给原用户发送一次普通失败提示，返回 DeliveryResult，不自动递归触发管理员通知。调用方传任务配置快照中的 user_failure_template。
+- `FailureNotifier(bindings, admin_ids, *, admin_failure_template=...)` 复制配置；`await notifier.notify_failure(platform_id, fault)` 在来源机器人下分别私信管理员。按平台、浏览器账号 scope、故障类别合并 300 秒：首条立即发送，窗口末仅在有后续事件时补一次总次数汇总。失败只记录脱敏日志，不递归或自动重试；空管理员列表会警告，不能当作通知成功。
+- `await notifier.close()` 取消并等待自身计时器和发送，不在卸载时额外发汇总。没有任务来源的启动故障由 main.py 显式枚举启用的 OneBot binding，分别传 source=None 的 Fault；不猜测默认平台。
+
+发送直接使用 CQHttp 的 call_action，与当前宿主的 OneBot 请求结构一致。`event.send()` 成功返回 None 且丢弃原始数据，`Context.send_message()` 的 bool 只代表路由是否存在，均不用于推断原始 OneBot 投递。原始客户端返回 None/False、异步或未知响应时按 unknown 停止，不重复全文；ActionFailed/ApiNotAvailable 或明确失败响应才允许有限降级。
+
+本轮仅执行消息和调度的必要测试，不打开浏览器或发送 QQ：
+
+```powershell
+& '..\..\..\venv\Scripts\python.exe' -m unittest discover -s tests -p 'test_messaging.py' -v
+& '..\..\..\venv\Scripts\python.exe' -S -m unittest discover -s tests -p 'test_scheduler.py' -v
+```
+
+无新增依赖。真实转发、普通消息及管理员私信验收留待明确测试对象后执行。Task 4 还需创建 main.py，并落实结果映射、取消传播、用户提示、管理员通知和 notifier.close。
+
+本轮必要回归结果：消息模块 49 项、调度 15 项全部通过；其中实际导入当前安装的 aiocqhttp 核验数据解包和明确拒绝异常，其余发送全部替身化。Ruff、语法及差异检查通过，未重跑浏览器，也未进行真实 QQ 或宿主加载验收。
 
 ## Task 2 浏览器接口
 
@@ -80,7 +105,7 @@ Task 0 历史验证中两个环境均通过 7 项测试，其中显式启用了�
 
 Task 0 历史联调中用户报告无法通过 Cloudflare 验证。Task 2 本地回归通过后，重新用专用 Chrome 打开一次 ChatGPT：就绪检查返回 login，账号与输入控件未出现；未提交问题或创建/删除会话，浏览器已关闭并保留 profile。仍需人工登录及账号设置核验；没有绕过验证或调用网页内部接口。
 
-真实平台仍需完成设置核验及一次自建会话的提问、最终回答读取和定向删除；Task 2 的本地页面测试不替代此项验收。Task 3 的 QQ 发送、Task 4 的宿主集成尚未实施。
+真实平台仍需完成设置核验及一次自建会话的提问、最终回答读取和定向删除；Task 2 的本地页面测试不替代此项验收。Task 3 已完成替身验证，真实 QQ 发送及 Task 4 宿主集成尚未验收。
 
 ## License
 
