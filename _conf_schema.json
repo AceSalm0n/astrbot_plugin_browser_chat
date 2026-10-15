@@ -1,0 +1,18 @@
+{
+  "restrict_groups": {"description": "启用群白名单", "type": "bool", "default": false},
+  "allowed_groups": {"description": "允许的群号", "hint": "字符串 ID；启用限制但列表为空时拒绝所有群", "type": "list", "default": []},
+  "restrict_users": {"description": "启用用户白名单", "type": "bool", "default": false},
+  "allowed_users": {"description": "允许的用户 QQ", "hint": "字符串 ID；群聊同时满足启用的两类限制，私聊只检查用户", "type": "list", "default": []},
+  "max_concurrency": {"description": "执行并发", "hint": "正整数；默认 1，大于 1 仍需真实平台验收", "type": "int", "default": 1},
+  "queue_capacity": {"description": "等待队列容量", "hint": "非负整数；0 表示不排队", "type": "int", "default": 5},
+  "execution_timeout_seconds": {"description": "网页执行超时（秒）", "hint": "有限正数；不包含发送和清理预算", "type": "float", "default": 180},
+  "queue_timeout_seconds": {"description": "排队超时（秒）", "type": "float", "default": 600},
+  "max_reply_chars": {"description": "答案总字符上限", "hint": "包含截断提示", "type": "int", "default": 12000},
+  "forward_node_chars": {"description": "单节点字符上限", "hint": "正整数，不超过答案总上限", "type": "int", "default": 1500},
+  "max_input_chars": {"description": "输入字符上限", "hint": "合并引用与问题后计数，超限拒绝", "type": "int", "default": 12000},
+  "keep_conversations": {"description": "保留插件创建的网页会话", "hint": "默认删除；策略在任务准入时固定", "type": "bool", "default": false},
+  "admin_ids": {"description": "插件管理员 QQ 列表", "hint": "字符串 ID；同时接收来源机器人私信通知并可使用 status/resume；宿主超级管理员也有管理权限", "type": "list", "default": []},
+  "user_failure_template": {"description": "用户失败提示模板", "hint": "允许 task_id/reason/category/source/time/count 简单占位符，不支持属性或表达式", "type": "text", "default": "任务 {task_id} 失败：{reason}。"},
+  "admin_failure_template": {"description": "管理员通知模板", "hint": "允许 task_id/reason/category/source/time/count；默认不包含问题或答案", "type": "text", "default": "[BrowserChat] {category}\n任务：{task_id}\n来源：{source}\n时间：{time}\n原因：{reason}\n次数：{count}"},
+  "browser_channel": {"description": "专用浏览器", "hint": "Chrome 已做本地验证；Edge 需单独验收。不会使用个人日常 profile", "type": "string", "options": ["chrome", "msedge"], "default": "chrome"}
+}

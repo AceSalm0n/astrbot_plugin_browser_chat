@@ -10,7 +10,30 @@
 
 **Spec:** 本文件第 2—8 节是完整需求和设计；第 9—10 节是实施及验收计划。无需阅读旧对话即可接手。
 
-**日期：** 2026-10-15（Asia/Shanghai）。**状态：** Task 1—3 实现及本地/替身验证已完成；真实 ChatGPT 和 QQ 仍须单独验收；Task 4—5 尚未实施。以下历史记录保留原阶段结论，当前接口以最新记录为准。
+**日期：** 2026-10-15（Asia/Shanghai）。**状态：** Task 1—4 代码及本地/替身/隔离装载检查已完成；运行中宿主热重载、真实 ChatGPT 和 QQ 仍须单独验收；Task 5 尚未实施。以下历史记录保留原阶段结论，当前接口以最新记录为准。
+
+### 2026-10-15 Task 4 实施记录（当前入口与验证边界）
+
+按本轮要求先推送 Task 3：`36d087e` 已推送 origin/main。随后新增 main.py、metadata.yaml、_conf_schema.json、tests/test_plugin.py；消息模块仅补 dependency 安全故障码及对应测试，浏览器/调度代码与测试未变。无新增依赖，不安装宿主缺失包，不自动提交或推送 Task 4。
+
+BrowserChatPlugin 继承 Star 注册，构造不建任务、不安装依赖；initialize 创建 TaskManager 并保持暂停，使用 StarTools.get_data_dir 的专用浏览器，未核验账号设置不会 READY。配置无效时报告字段名并暂停 config，Playwright 缺失时暂停 dependency。配置 schema 的 16 个默认字段与 validate_config 一致，拒绝布尔冒充数字、NaN/无穷/超大超时整数、非法 QQ ID及模板；任务使用准入配置快照，重载新实例取新配置。
+
+- 单个锚定 RegexFilter 接受 `/ask ai`、`/ask status`、`/ask resume`、`/ask cancel`；不叠加 command 过滤器。剥离宿主前缀后的 `ask …` 仅在 is_at_or_wake_command=True 时执行。直接引用仅提取 Plain，已确认的宿主前缀通过原 Plain 链规范化，不以合并 message_str 充当问题正文。
+- 认领后、任何 await 前 stop_event；普通 async handler 直接 await event.send 回执，成功 None 不视为失败，不 yield 回执。仅 OneBot 来源可操作，防止其他平台伪造相同 QQ ID获得插件管理员权限。status/resume 使用宿主 is_admin 或 admin_ids，独立于使用白名单；cancel 只针对当前来源平台与调用者用户键，无任意任务/用户参数。
+- `/ask resume` 不自动确认设置；`/ask resume 已核验` 仅供管理员在人工登录并关闭记忆/引用历史/自定义指令后使用。生命周期锁和 closing 标记串行化恢复与卸载；旧 runner 尚在清理时不探测/恢复浏览器，不开放准入。
+- runner 按生成、发送、finally 清理编排。生成用 asyncio.wait 的完成集合明确判定截止；超时或取消先取消并等待生成子任务退出，即使底层吞取消返回答案也不发送。180 秒只限生成，发送共享独立 30 秒预算，清理沿浏览器自身 20 秒预算，不叠加可能提前放槽的外层清理超时。
+- 发送前再次检查取消；confirmed 记 SUCCESS，unknown/不确定 partial 记 DELIVERY_UNKNOWN；DeliveryCancelled.result 先记录再传播取消。CLEANING 不再注入第二次取消，名额直到 runner 完全退出才释放；已确认或不确定的投递不被清理失败/后续取消覆盖。取消回执明确说明已提交或结果未知的消息不会撤回。
+- 每个接纳任务有一个不保存正文的终态 watcher，覆盖未进入 runner 的排队超时/暂停/取消。用户失败提示只发送一次；超时、浏览器/投递/清理故障交给按来源绑定的 notifier。清理失败独立记录、暂停准入，成功答案不重发或改判失败。失败投递日志保留确认段数及 uncertain，无正文。
+- 来源事件通过 OneBotBinding.from_event 绑定；初始化时对已启用 OneBot 实例使用公开 get_login_info 读操作确定账号（每实例最多 5 秒），不使用随机 client_self_id 或私有连接表。无法识别时只记录日志，待合法来源事件注册绑定；同一平台 ID出现不同机器人账号要求重载，拒绝错路由。每来源持有独立配置快照 notifier，无需修改 Task 3 的接口。
+- async terminate 直接定义在插件类中，不定义 __del__。关闭准入后等待调度器完整清理、关闭专用 browser、等待终态提示，再取消并等待通知计时器/发送。并发 terminate 共享关闭任务，初始化/恢复期间卸载不会重新开放。
+
+**本轮验证：** venv Python 3.10.6 下必要回归共 87 项（messaging 50、scheduler 15、plugin 22）全部通过，4.625 秒；不重跑未改动的浏览器套件。关键 RED→GREEN 包括模块缺失、状态字段接缝、吞取消的迟到回答、超大超时整数及依赖故障分类；单次只读复核未发现确定 P1/P2。Ruff/语法/差异检查见最终交付记录。
+
+**真实源码隔离装载：** venv 直接导入宿主 API因缺 loguru 受阻，未补装或升级；已安装的全局 Python 3.10.6 在独立 ASTRBOT_ROOT 下成功导入真实 API及正式插件路径，用真实 PluginManager schema解析、AstrBotConfig、metadata、Star/handler 注册进行检查。真实 WakingCheckStage→StarRequestSubStage→ProcessStage 处理 5 个命令（含 #ask ai），2 次问题交给浏览器替身，默认 LLM调用为 0；回执替身故意不置 _has_send_oper，证明 stop_event 可阻止默认 LLM。会话插件启用策略固定为允许，浏览器/OneBot/LLM替身，不是真实 QQ 验收。
+
+实际 PluginManager._terminate_plugin 成功调用插件 async terminate，再构造并卸载新实例验证生命周期；仅在隔离子进程中，不是对运行宿主调用 reload_plugin。宿主声明 Python >=3.12，以上源码检查不能推出官方支持 3.10 或运行宿主的 sys.prefix。没有访问真实浏览器或发送真实 QQ，也没有重启、重载运行宿主。
+
+后续若进行真实插件热重载，影响为：仅本插件停止准入、取消旧任务并等待清理，可能给已有任务发送失败提示/管理员通知，关闭本插件专用浏览器再创建新实例，人工设置确认需重新完成；已提交 QQ 消息不可撤回。不得重启整个宿主。此运行中验收、人工登录/真实 DOM问答删除及获准 QQ对象的收发仍是未解决验收项，Task 5 继续处理。
 
 ### 2026-10-15 Task 3 实施记录（当前接口与授权）
 
@@ -398,10 +421,11 @@ runner 包含完整执行、投递和有界 finally 清理；进入清理前显�
 
 **接口：** main.py 将事件转换为 Job并提交；runner 按 `ask → send_answer → finally cleanup` 编排；initialize/terminate 持有全部资源。
 
-- [ ] 测试精确命令匹配、避免宿主默认 LLM重复回复、权限拒绝不打开浏览器；管理员命令不受普通用户冒用。
-- [ ] 测试浏览器超时180秒、发送30秒、清理20秒互不吞掉结果；取消、重载和完成同时发生时只产生一个任务终态。区分发送开始前取消与已经提交平台的请求，不能虚报后者已撤回。
-- [ ] 测试暂停状态拒绝新单、等待任务一次性失败、恢复前核验页面/残留、配置重载取消旧任务。
-- [ ] 添加开发版元数据及配置 schema，核对 import 和宿主装载；依赖缺失提示应可诊断，不在加载时自行安装。
+- [x] 模拟与隔离实际过滤链验证精确命令和默认 LLM拦截；权限拒绝不提交浏览器任务，管理权限独立检查。
+- [x] 验证生成/发送预算独立、清理期间占槽、取消/卸载/完成竞争及投递结果保留；清理 20 秒截止由已验证 Task 2 模块负责。
+- [x] 验证暂停拒绝、排队超时/暂停一次提示、恢复等待旧任务退出和浏览器 READY、旧实例任务取消及新配置快照。
+- [x] 开发版元数据/schema、真实 API隔离导入及管理器卸载分支通过；缺依赖保持诊断暂停，不自动安装。
+- [ ] 在明确影响范围后核验运行中宿主真实热重载；本轮未执行，不能用隔离生命周期结果替代。
 
 **完成条件：** 模拟生命周期、宿主加载和热重载通过；只改插件文件。
 

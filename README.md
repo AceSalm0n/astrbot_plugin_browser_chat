@@ -2,9 +2,39 @@
 
 计划通过专用浏览器操作 ChatGPT 网页，将文字回答返回 QQ 的 AstrBot 插件。后续考虑 Gemini 和 DeepSeek 适配。
 
-**当前状态：已实现 Task 1 纯逻辑、Task 2 浏览器模块及 Task 3 发送通知模块。浏览器用本地页面验证，发送用 OneBot 替身验证；真实 ChatGPT 闭环及 QQ 验收未通过，尚无插件入口，暂不可作为完整插件使用。**
+**当前状态：Task 1—4 开发版代码已实现，含 AstrBot 入口。模拟集成和隔离宿主装载检查通过；真实 ChatGPT、QQ 及运行中宿主热重载仍未验收，不能当作已完成真实接入的可用插件。**
 
-开发前阅读 [AGENTS.md](AGENTS.md) 和 [完整方案与开发交接](docs/superpowers/plans/2026-10-15-browser-chat-handoff.md)。本次仅实施 Task 3，不修改浏览器与调度行为，不发送真实 QQ 消息。
+开发前阅读 [AGENTS.md](AGENTS.md) 和 [完整方案与开发交接](docs/superpowers/plans/2026-10-15-browser-chat-handoff.md)。本次实施 Task 4，浏览器与调度行为保持不变；消息模块仅新增 dependency 的安全故障文案。不发送真实 QQ 消息。
+
+## Task 4 插件入口
+
+`main.py` 通过继承 Star 注册，导入不启动浏览器、不安装依赖。initialize 校验配置并启动专用可见浏览器，默认保持暂停；terminate 停止准入、取消并等待旧任务清理、关闭专用浏览器及全部通知任务，不定义 __del__。
+
+| 命令 | 权限及行为 |
+| --- | --- |
+| `/ask ai 问题` | 满足启用的群/用户白名单；可直接引用文字，按快照进入有界队列 |
+| `/ask cancel` | 仅取消调用者在同一平台的未完成任务，跨群/私聊共享；等待清理，已提交或结果未知的消息不会撤回 |
+| `/ask status` | 宿主超级管理员或 admin_ids 中的插件管理员；只展示总计数和暂停原因 |
+| `/ask resume` | 同上；检查旧任务已退出、网页就绪与残留，不自动确认账号设置 |
+| `/ask resume 已核验` | 同上；仅在人工已登录，并关闭记忆、引用聊天历史及自定义指令后使用 |
+
+`admin_ids` 同时用于管理员通知及 status/resume 授权；它不绕过 ai 的使用白名单。裸群文本 `ask ai` 不执行；宿主已通过前缀或 @ 唤醒后才接受剥离前缀的形式。本机 `#ask ai` 已在隔离的当前宿主过滤链验证。入口先 stop_event，再直接发送回执；不用 yield 回执，避免默认 LLM 重复响应。
+
+首次加载后，在专用浏览器窗口手动打开 ChatGPT 并登录，实际核验账号设置，再发 `/ask resume 已核验`。缺 Playwright 时保持 dependency 暂停，使用实际宿主解释器安装 requirements.txt；插件不会自动安装，也不升级 AstrBot。配置无效时保持 config 暂停，只报告字段名，修正后重载本插件。全局唤醒、宿主白名单及插件会话启用规则仍然有效。
+
+配置见 [_conf_schema.json](_conf_schema.json)，默认：公开使用，1 执行＋5 等待，每用户 1 个未完成任务；执行 180 秒、排队 600 秒；输入/总输出 12000 字符、节点 1500 字符；默认删除自建会话；管理员列表为空；Chrome。发送使用独立 30 秒总预算，清理由浏览器模块使用 20 秒预算。白名单、保留策略和模板使用准入快照；结构配置修改通过插件重载生效。
+
+本轮验证：消息 50 项＋调度 15 项＋模拟插件集成 22 项，**87 项通过**。隔离 ASTRBOT_ROOT 子进程还验证了真实 AstrBot API 导入、schema/metadata、Star 注册、5 个命令经真实 waking/process 链识别、默认 LLM 调用为 0、真实管理器 async terminate 分支和新实例生命周期。浏览器、QQ、LLM 使用替身，会话启用策略在该探针中固定为允许；这不是运行中宿主热重载验收。
+
+venv Python 3.10.6 缺宿主依赖 loguru，未补装或升级；另一已安装的全局 Python 3.10.6 可完成真实 API 隔离检查。宿主项目声明 Python >=3.12，独立检查不等于官方支持 3.10，也不能证明运行宿主的 sys.prefix/import 路径。
+
+必要回归（排除未改动的浏览器套件）：
+
+```powershell
+& '..\..\..\venv\Scripts\python.exe' -m unittest discover -s tests -p 'test_[mps]*.py' -v
+```
+
+后续真实重载的实际影响：仅本插件停止接单，旧任务取消并等清理，可能向已有任务来源发送失败提示和管理员通知；专用浏览器关闭并重新初始化，人工设置确认需要重新完成。已提交的 QQ 消息不能撤回，其他插件及整个宿主不应重启。本次没有执行这项运行中操作。
 
 ## Task 3 发送与通知接口
 
@@ -27,7 +57,7 @@
 & '..\..\..\venv\Scripts\python.exe' -S -m unittest discover -s tests -p 'test_scheduler.py' -v
 ```
 
-无新增依赖。真实转发、普通消息及管理员私信验收留待明确测试对象后执行。Task 4 还需创建 main.py，并落实结果映射、取消传播、用户提示、管理员通知和 notifier.close。
+Task 3 无新增依赖。真实转发、普通消息及管理员私信验收留待明确测试对象后执行。Task 4 已接入结果映射、取消传播、用户提示、管理员通知和 notifier.close，当前集成验证见上文。
 
 本轮必要回归结果：消息模块 49 项、调度 15 项全部通过；其中实际导入当前安装的 aiocqhttp 核验数据解包和明确拒绝异常，其余发送全部替身化。Ruff、语法及差异检查通过，未重跑浏览器，也未进行真实 QQ 或宿主加载验收。
 
@@ -45,7 +75,7 @@
 
 `owned_sessions.json` 只保存任务编号、时间、自建会话 ID/URL、原保留策略、提交/回答/清理状态；不保存正文或凭据。通过临时文件、fsync 和原子替换写入。未知会话 ID不猜测，不遍历删除历史；损坏记录或未解决清理使恢复保持暂停。当前生产选择器仍需登录后实测，本地 fixture 成功不等于真实站点已接通。
 
-后续 runner 按 `ask(..., keep=job.config["keep_conversations"]) → send_answer → finally cleanup` 编排；清理前设置 `job.phase = JobPhase.CLEANING`，使用 `CleanupState(result.status.value)` 映射到调度器。恢复准入须先确认浏览器 READY、旧任务退出，再调用调度器 resume。当前没有 main.py 调用方。
+当前 main.py runner 按 `ask(..., keep=job.config["keep_conversations"]) → send_answer → finally cleanup` 编排；清理前设置 `job.phase = JobPhase.CLEANING`，使用 `CleanupState(result.status.value)` 映射到调度器。恢复准入先确认浏览器 READY、旧任务退出，再调用调度器 resume。
 
 必要本地回归（可见 Chrome、临时 profile、127.0.0.1 页面，无真实账号或 QQ）：
 
@@ -105,7 +135,7 @@ Task 0 历史验证中两个环境均通过 7 项测试，其中显式启用了�
 
 Task 0 历史联调中用户报告无法通过 Cloudflare 验证。Task 2 本地回归通过后，重新用专用 Chrome 打开一次 ChatGPT：就绪检查返回 login，账号与输入控件未出现；未提交问题或创建/删除会话，浏览器已关闭并保留 profile。仍需人工登录及账号设置核验；没有绕过验证或调用网页内部接口。
 
-真实平台仍需完成设置核验及一次自建会话的提问、最终回答读取和定向删除；Task 2 的本地页面测试不替代此项验收。Task 3 已完成替身验证，真实 QQ 发送及 Task 4 宿主集成尚未验收。
+真实平台仍需完成设置核验及一次自建会话的提问、最终回答读取和定向删除；Task 2 的本地页面测试不替代此项验收。Task 3/4 已完成替身及隔离装载检查，真实 QQ 发送和运行中宿主热重载尚未验收。
 
 ## License
 

@@ -1,0 +1,14 @@
+name: astrbot_plugin_browser_chat
+display_name: 浏览器问答（开发版）
+desc: 通过专用浏览器进行独立会话问答，提供有界排队、定向清理及 OneBot 发送。真实平台闭环待验收。
+version: 0.1.0
+author: AceSalm0n
+repo: https://github.com/AceSalm0n/astrbot_plugin_browser_chat
+support_platforms:
+  - aiocqhttp
+help: |
+  /ask ai 问题 - 文字问答，可直接引用文字消息
+  /ask cancel - 取消自己的未完成任务，不撤回已提交消息
+  /ask status - 管理员查看状态
+  /ask resume - 管理员重新核验网页状态
+  /ask resume 已核验 - 人工确认关闭记忆、引用历史和自定义指令后使用

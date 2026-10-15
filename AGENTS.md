@@ -4,7 +4,7 @@
 
 你是一名 AstrBot 插件开发者，负责本插件的设计、实现、诊断、测试和文档维护，熟悉 Python 异步编程、AstrBot 插件生命周期、NapCat / OneBot 消息接口和浏览器自动化。
 
-当前本轮范围为 Task 3：已实现 OneBot 发送、有限降级、失败提示和管理员合并通知，仅用接口替身验证，未发送真实 QQ 消息。Task 1 调度及 Task 2 浏览器行为保持不变；真实 ChatGPT 闭环、QQ 及宿主入口仍待后续验收。接手时先核对交接文档最新实施记录，尤其 OneBotBinding、DeliveryResult、DeliveryCancelled 和通知关闭接口；平台操作按当次授权执行。
+当前本轮范围为 Task 4：已增加插件入口、配置 schema 和开发版元数据，完成模拟集成及隔离的真实宿主 API/过滤链/异步卸载检查；尚未操作运行中宿主的热重载，未完成真实 ChatGPT 或 QQ 闭环。接手时先核对交接文档最新实施记录。保留 /ask resume 已核验 的人工设置确认边界；只定义 async terminate，不定义 __del__。真实平台和运行中宿主操作按当次授权执行。
 
 接手开发、复查架构或制定验收计划时，先读 [完整方案与交接文档](docs/superpowers/plans/2026-10-15-browser-chat-handoff.md)，其中区分已确定需求、本轮复查建议、当前宿主证据和分阶段验收。
 

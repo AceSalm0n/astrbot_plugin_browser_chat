@@ -234,6 +234,7 @@ DEFAULT_ADMIN_TEMPLATE = (
 _LOGGER = logging.getLogger(__name__)
 _FIELDS = {"task_id", "reason", "category", "source", "time", "count"}
 _REASONS = {
+    "dependency": "缺少浏览器依赖，请用宿主解释器安装 requirements.txt",
     "login": "需要重新登录网页账号",
     "challenge": "网页需要人工验证",
     "rate_limit": "网页暂时限流",

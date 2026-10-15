@@ -484,6 +484,13 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
 
 
 class TemplateTests(unittest.TestCase):
+    def test_dependency_startup_fault_has_diagnostic_safe_reason(self):
+        text = render_failure(
+            Fault("startup", None, "dependency", "dependency"), admin=True
+        )
+        self.assertIn("依赖", text)
+        self.assertIn("dependency", text)
+
     def test_template_validation_blocks_lookup_conversion_and_format_specs(self):
         for template in (
             "{unknown}",
