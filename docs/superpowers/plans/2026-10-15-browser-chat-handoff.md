@@ -10,7 +10,31 @@
 
 **Spec:** 本文件第 2—8 节是完整需求和设计；第 9—10 节是实施及验收计划。无需阅读旧对话即可接手。
 
-**日期：** 2026-10-15（Asia/Shanghai）。**状态：** Task 1 纯逻辑已实现并测试；Task 0 真实站点受阻；Task 2—5 尚未实施。
+**日期：** 2026-10-15（Asia/Shanghai）。**状态：** Task 1 纯逻辑和 Task 2 浏览器实现已完成；真实站点闭环仍须单独验收；Task 3—5 尚未实施。以下历史记录保留原阶段结论，当前接口以最新记录为准。
+
+### 2026-10-15 Task 2 实施记录（当前接口与授权）
+
+按用户要求先推送一次：`35380c4` 已推送到 `origin/main`，内容为 Task 0/1 基线。随后仅修改 `browser_chat.py`、浏览器测试、本地 fixture 和文档；Task 2 保留为未提交修改，不再次自动推送。`scheduler.py`、`messaging.py` 及其测试行为保持不变，不发送 QQ，不实现宿主入口。
+
+当前 `ChatGPTBrowser` 不依赖 AstrBot 事件，接口为：
+
+- `ChatGPTBrowser(data_dir: Path, channel="chrome", *, base_url="https://chatgpt.com/")`：生产地址只允许 ChatGPT 根地址，回环根地址用于本地测试；专用 profile 保持不变。
+- `start()` 启动后保持 `PAUSED/config`。`resume(*, account_settings_verified=False) -> BrowserStatus` 先处理已知残留，再核验页面；人工实际关闭记忆、引用聊天历史和个人自定义指令后，调用方才可传 True。登录失效或验证码使确认失效；不能把此参数自动设为 True。
+- `ask(task_id, prompt, timeout_s, *, keep=False) -> BrowserAnswer`：新增 keep 关键字用于提交前持久化原保留策略。返回不可变 `BrowserAnswer(text, conversation_id)`；ID可能未知。异常使用 `BrowserError.category/submission_unknown`，取消传播 `CancelledError`。
+- `cleanup(task_id, keep=None) -> CleanupResult`：返回不可变 status、task_id、conversation_id、reason；status 为 not_created/retained/deleted/cleanup_failed/cleanup_unknown。keep 仅作兼容参数，不能覆盖记录中的策略。ask 活跃时返回 busy，调用方应先取消并等待 ask 退出，再在 finally 中清理。
+- `close()` 停止新操作、取消自身问答、等待清理并关闭自身 context/driver；晚到的页面创建仍有归属和收尾任务。resume 在操作未退出、清理残留未解决或写入未成功时不会 READY。
+
+完成判定同时检查新出现且与本次问题匹配的 user 消息、本次非空 assistant、停止生成、完成控件和全文稳定窗口；不以旧答案、空白或长稳定前缀冒充完成。问题只点击提交一次，提交不确定时不重试；URL变化不能单独建立会话归属。超时及取消不会返回可继续投递的迟到答案。浏览器返回完整答案，截断分段仍由 Task 1 的 split_answer 负责。
+
+`owned_sessions.json` v1 保存 task_id、UTC创建时间、conversation_id/url、keep 快照、submission、answer_result 和 cleanup，回答与清理独立记录。原子写入使用同目录临时文件、flush/fsync、os.replace；不写正文或凭据。加载校验字段、类型、同源精确地址及“有 ID必须已确认提交”关系，损坏文件保留并暂停。重启仅处理这些记录，不枚举删除账号历史；未知 ID的默认删除返回 cleanup_unknown。删除确认不明确时不会记为 deleted。
+
+后续 Task 4 的 runner 使用 `ask(..., keep=job.config["keep_conversations"]) → send_answer → finally cleanup`，清理前设置 `job.phase = JobPhase.CLEANING`，将 `CleanupState(result.status.value)` 写入任务。错误交给 Task 3 的通知层，禁止因 submission_unknown 重复提问。恢复准入先确认浏览器 READY及旧任务退出，再调用 TaskManager.resume；当前无 main.py 调用方需要迁移。
+
+本轮采用本地 HTTP 可控 DOM 页面及临时 Chrome profile，覆盖逐步生成、长停顿、空回答、稳定长前缀、代码链接、旧回答、登录失效、验证码、地区错误、限流、页面结构变化、提交不确定、不匹配问题、超时、取消、并发标签页、定向删除、保留快照、重启残留、坏记录和原子写入失败。生产 DOM 选择器仍是候选，必须登录后单独验证，不能由 fixture 通过推定可用。用户要求节省额度后，仅保留当前必要回归，不再进行第二套 Playwright 版本复测或额外审查。
+
+**最终本地验证：** venv Python 3.10.6 / Playwright 1.58.0 / 系统 Chrome，`unittest discover` 共 94 项，93 通过、1 跳过，耗时 162.406 秒；跳过的是 Task 0 旧的可选可见 Chrome 测试，Task 2 的本地页面测试均已执行。Ruff check/format、py_compile 和 git diff --check 通过；调度与消息源文件及其测试相对推送基线无差异。未运行宿主加载、QQ 或第二套版本复测。
+
+**真实页面核验：** 本地全部通过后，用插件专用 profile 打开一次 ChatGPT 根页面，3 秒后的就绪检查返回 `login`，账号控件和输入控件均未出现，页面标题未命中 Cloudflare 挑战特征。没有据此宣称登录成功或地区问题已解决。未提交问题，未创建或删除会话；专用浏览器已正常关闭，profile 保留。仍需人工登录、账号设置核验，以及候选 DOM 选择器/一次问答和定向删除的真实验收。这是未解决验收项，不以本地测试替代。
 
 ### 2026-10-15 Task 1 实施记录（当前接口与授权）
 
@@ -250,7 +274,7 @@ runner 包含完整执行、投递和有界 finally 清理；进入清理前显�
 - `scheduler.py`：`Job` 保存 task_id、去重键、用户键、prompt、来源路由、准入配置快照、时间、阶段/结果/清理状态。`Admission` 保存 accepted、task_id、queue_position、reason。
 - `TaskManager(concurrency, capacity, queue_timeout_s, runner)`；`async start() -> None`、`async submit(job: Job) -> Admission`、`async cancel(user_key) -> bool`、`async pause(reason) -> None`、`async resume() -> None`、`snapshot() -> QueueStatus`、`async close() -> None`。runner 为 `async (Job) -> None`，完整覆盖执行、发送和清理；QueueStatus 只含状态、计数及暂停原因，不含其他用户正文。构造不启动任务，initialize 调用 start；start/close 幂等。
 - pause 关闭准入、终止等待任务并请求执行任务安全退出；从 runner 内报告故障时不能等待或取消自身而造成死锁，当前 runner 继续走 finally 清理。resume 仅在浏览器检查 READY 且旧任务退出清理后开放准入；close 负责等待退出。管理员命令经 main.py 协调浏览器与调度器，不能只切换一个 ready 标志。
-- `browser_chat.py`：`ChatGPTBrowser.start()`、`ask(task_id, prompt, timeout_s) -> BrowserAnswer`、`cleanup(task_id, keep) -> CleanupResult`、`resume() -> BrowserStatus`、`close()` 均为 async。`BrowserAnswer` 含 text、conversation_id；异常分类不混入答案文本。失败时归属记录仍可用于 cleanup。BrowserStatus 包含 STARTING、READY、PAUSED、STOPPING，PAUSED 另带 login/challenge/rate_limit/browser/cleanup/config 原因；启动不会自动把未登录状态视为 READY。
+- `browser_chat.py`：`ChatGPTBrowser.start()`、`ask(task_id, prompt, timeout_s, *, keep=False) -> BrowserAnswer`、`cleanup(task_id, keep=None) -> CleanupResult`、`resume(*, account_settings_verified=False) -> BrowserStatus`、`close()` 均为 async。keep 在 ask 前持久化，cleanup 不覆盖原策略；人工账号设置核验才可传 True。`BrowserAnswer` 含 text、conversation_id；异常分类不混入答案文本。失败时归属记录仍可用于 cleanup。BrowserStatus 包含 STARTING、READY、PAUSED、STOPPING，PAUSED 另带 login/challenge/rate_limit/browser/cleanup/config 原因；启动不会自动把未登录状态视为 READY。
 - `messaging.py`：`check_access(sender_id, group_id, config) -> bool`、`extract_prompt(event, max_input_chars) -> str`、`split_answer(text, total_limit, node_limit) -> list[str]`；`async send_answer(route, parts) -> DeliveryResult` 返回 confirmed/partial/unknown/failed 及确认段数，confirmed 只表示接口确认接受。`async notify_failure(platform_id, fault) -> None` 内部处理合并及通知失败。管理命令另在 main.py 校验管理员身份。
 - 模块之间只传必要数据和回调；不为单一站点提前构建多 Provider 注册器、通用任务总线或数据库。来源路由保存 platform_id、会话类型、目标 ID及必要发送句柄，不持久化整个事件对象。
 
@@ -324,10 +348,10 @@ runner 包含完整执行、投递和有界 finally 清理；进入清理前显�
 
 **接口：** 完成第 7 节 `ask/cleanup/resume` 及 BrowserAnswer/CleanupResult/BrowserStatus；输入为 task_id、prompt、timeout，不依赖 AstrBot 事件。
 
-- [ ] 本地页面覆盖分批生成、长停顿、始终空白、登录页、限流、错误横幅、未确认提交、选择器失效，先建立失败测试再实现。
-- [ ] 验证只有本次最终回答能返回；稳定前缀不能误报完成；取消后不再产生可发送结果。
-- [ ] 验证成功、异常、超时、保留开启、删除失败、会话 ID未知和浏览器关闭后的清理结果；保留设置不改变其他任务。
-- [ ] 记录所有新会话归属并验证原子写入；重启只检查已知自建记录，遵守记录中的保留策略，不遍历删除账号历史。
+- [x] 本地页面覆盖分批生成、长停顿、始终空白、登录页、限流、错误横幅、未确认提交、选择器失效，先建立失败测试再实现。
+- [x] 验证只有本次最终回答能返回；稳定前缀不能误报完成；取消后不再产生可发送结果。
+- [x] 验证成功、异常、超时、保留开启、删除失败、会话 ID未知和浏览器关闭后的清理结果；保留设置不改变其他任务。
+- [x] 记录所有新会话归属并验证原子写入；重启只检查已知自建记录，遵守记录中的保留策略，不遍历删除账号历史。
 
 **完成条件：** 本地页面全部行为测试通过；真实站点选择器与清理单独验收，不以 fixture 成功替代。
 
