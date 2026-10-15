@@ -23,3 +23,8 @@ playwright-report/
 test-results/
 .idea/
 .vscode/
+
+
+#agents工作文档
+AGENTS.md
+.claude/
