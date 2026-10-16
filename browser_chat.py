@@ -35,6 +35,10 @@ USER = '[data-message-author-role="user"]'
 ASSISTANT = '[data-message-author-role="assistant"]'
 COPY = '[data-testid="copy-turn-action-button"]'
 CONVERSATION_ID = re.compile(r"[A-Za-z0-9_-]{1,200}")
+PROFILE_NAME = re.compile(r"[A-Za-z0-9_-]{0,64}")
+RESERVED_PROFILE_NAMES = {"CON", "PRN", "AUX", "NUL"} | {
+    f"{prefix}{number}" for prefix in ("COM", "LPT") for number in range(1, 10)
+}
 
 
 class BrowserStatus(str, Enum):
@@ -88,8 +92,9 @@ class ChatGPTBrowser:
     Args:
         data_dir: Plugin data directory from StarTools.get_data_dir() in the
             future host integration; never a daily browser profile directory.
-        channel: Installed browser channel. Only Chrome is currently tested.
+        channel: Installed Chrome or Edge browser channel.
         base_url: ChatGPT root URL, or a loopback root for local UI tests.
+        profile_name: Dedicated directory name; empty selects the channel default.
     """
 
     def __init__(
@@ -98,7 +103,30 @@ class ChatGPTBrowser:
         channel: str = "chrome",
         *,
         base_url: str = "https://chatgpt.com/",
+        profile_name: str = "",
     ) -> None:
+        if channel not in ("chrome", "msedge"):
+            raise ValueError("Invalid browser channel")
+        if (
+            not isinstance(profile_name, str)
+            or PROFILE_NAME.fullmatch(profile_name) is None
+            or profile_name.upper() in RESERVED_PROFILE_NAMES
+        ):
+            raise ValueError("Invalid browser profile name")
+        profile_name = profile_name or (
+            "browser_profile" if channel == "chrome" else "browser_profile_msedge"
+        )
+        data_root = Path(data_dir).resolve()
+        profile_dir = data_root / profile_name
+        registry_path = data_root / (
+            "owned_sessions.json"
+            if profile_dir == data_root / "browser_profile"
+            else f"owned_sessions.{profile_name}.json"
+        )
+        for path in (profile_dir, registry_path):
+            resolved = path.resolve()
+            if resolved == data_root or not resolved.is_relative_to(data_root):
+                raise ValueError("Browser profile path escapes plugin data directory")
         parsed = urlsplit(base_url)
         try:
             loopback = (
@@ -120,8 +148,8 @@ class ChatGPTBrowser:
             raise ValueError("Unsupported browser origin")
         self.base_url = base_url.rstrip("/") + "/"
         self._origin = f"{parsed.scheme}://{parsed.netloc}"
-        self.profile_dir = Path(data_dir).resolve() / "browser_profile"
-        self._registry_path = Path(data_dir).resolve() / "owned_sessions.json"
+        self.profile_dir = profile_dir
+        self._registry_path = registry_path
         self.channel = channel
         self.status = BrowserStatus.PAUSED
         self.pause_reason = "config"

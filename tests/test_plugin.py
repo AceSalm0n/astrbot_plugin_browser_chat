@@ -145,6 +145,19 @@ class Browser:
 
 
 class ConfigTests(unittest.TestCase):
+    def test_profile_configuration_validation_and_default(self):
+        self.assertEqual(m.validate_config({})["browser_profile_name"], "")
+        self.assertEqual(
+            m.validate_config({"browser_profile_name": "edge_manual_diagnostic"})[
+                "browser_profile_name"
+            ],
+            "edge_manual_diagnostic",
+        )
+        for name in (None, 1, "../secret", "a/b", "nul", "COM1", "LPT9", "a" * 65):
+            with self.subTest(name=name), self.assertRaises(m.ConfigError) as caught:
+                m.validate_config({"browser_profile_name": name})
+            self.assertEqual(str(caught.exception), "browser_profile_name")
+
     def test_schema_defaults_match_validation_and_lifecycle_is_async(self):
         schema = json.loads(
             (Path(__file__).resolve().parents[1] / "_conf_schema.json").read_text(
@@ -184,6 +197,18 @@ class ConfigTests(unittest.TestCase):
 
 
 class PluginTests(unittest.IsolatedAsyncioTestCase):
+    async def test_browser_receives_profile_configuration_snapshot(self):
+        await self.plugin.terminate()
+        config = {"browser_channel": "msedge", "browser_profile_name": "edge_test"}
+        self.plugin = m.BrowserChatPlugin(self.context, config)
+        with patch.object(m, "ChatGPTBrowser", return_value=self.browser) as factory:
+            await self.plugin.initialize()
+            config["browser_profile_name"] = "changed"
+            factory.assert_called_once_with(
+                Path(self.temp.name), channel="msedge", profile_name="edge_test"
+            )
+            self.assertEqual(self.plugin.settings["browser_profile_name"], "edge_test")
+
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.browser = Browser()

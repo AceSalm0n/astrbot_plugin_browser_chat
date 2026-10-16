@@ -14,5 +14,6 @@
   "admin_ids": {"description": "插件管理员 QQ 列表", "hint": "字符串 ID；同时接收来源机器人私信通知并可使用 status/resume；宿主超级管理员也有管理权限", "type": "list", "default": []},
   "user_failure_template": {"description": "用户失败提示模板", "hint": "允许 task_id/reason/category/source/time/count 简单占位符，不支持属性或表达式", "type": "text", "default": "任务 {task_id} 失败：{reason}。"},
   "admin_failure_template": {"description": "管理员通知模板", "hint": "允许 task_id/reason/category/source/time/count；默认不包含问题或答案", "type": "text", "default": "[BrowserChat] {category}\n任务：{task_id}\n来源：{source}\n时间：{time}\n原因：{reason}\n次数：{count}"},
-  "browser_channel": {"description": "专用浏览器", "hint": "Chrome 已做本地验证；Edge 需单独验收。不会使用个人日常 profile", "type": "string", "options": ["chrome", "msedge"], "default": "chrome"}
+  "browser_channel": {"description": "专用浏览器", "hint": "Chrome/msedge；使用插件专用资料，不使用个人日常 profile", "type": "string", "options": ["chrome", "msedge"], "default": "chrome"},
+  "browser_profile_name": {"description": "专用资料目录名称", "hint": "留空：Chrome 使用 browser_profile，Edge 使用 browser_profile_msedge。显式名称为 1—64 位英文字母、数字、下划线或短横线，不接受路径或 Windows 保留名称；不同目录的会话归属记录独立", "type": "string", "default": ""}
 }

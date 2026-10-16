@@ -2,11 +2,89 @@
 
 计划通过专用浏览器操作 ChatGPT 网页，将文字回答返回 QQ 的 AstrBot 插件。后续考虑 Gemini 和 DeepSeek 适配。
 
-**当前状态：Task 1—4 开发版代码已实现，含 AstrBot 入口。模拟集成和隔离宿主装载检查通过；真实 ChatGPT、QQ 及运行中宿主热重载仍未验收，不能当作已完成真实接入的可用插件。**
+**当前状态：Task 5 验收进行中。完整单元及 Chrome 本地页面测试 134/134 通过，Ruff 和隔离装载检查通过；真实 ChatGPT＋QQ 主流程尚未通过，不能声明真实接入可用。**
 
-开发前阅读 [AGENTS.md](AGENTS.md) 和 [完整方案与开发交接](docs/superpowers/plans/2026-10-15-browser-chat-handoff.md)。本次实施 Task 4，浏览器与调度行为保持不变；消息模块仅新增 dependency 的安全故障文案。不发送真实 QQ 消息。
+开发前阅读 [AGENTS.md](AGENTS.md) 和 [完整方案与开发交接](docs/superpowers/plans/2026-10-15-browser-chat-handoff.md)。本次仅验收及修复本插件；真实消息仅限用户明确指定的来源机器人、测试群、私聊与管理员。下面历史开发阶段的测试数不替代本轮完整结果。
 
-## Task 4 插件入口
+## 安装与首次使用
+
+1. 将私有仓库放在 `AstrBot/data/plugins/astrbot_plugin_browser_chat`。已有安装保留 Git 修改、插件配置和专用 profile；本插件暂为开发版 `0.1.0`，不代表已通过市场或真实平台验收。
+2. 使用**实际运行 AstrBot 的 Python** 安装本插件 requirements，不升级宿主或其他插件。当前范围 `playwright>=1.58.0,<1.61`，调用系统 Chrome，无需下载 Playwright 自带浏览器。导入模块不会安装依赖。
+
+   ```powershell
+   & '<实际宿主的 python.exe>' -m pip install -r '<插件目录>\requirements.txt'
+   ```
+
+3. 在 AstrBot WebUI 配置并仅加载/重载本插件。先设置 `admin_ids`；测试阶段建议同时启用群、用户白名单，仅填写获准的对象。空管理员列表会警告，不能当作通知成功。缺依赖或配置错误时保持暂停，通过 `/ask status` 和脱敏日志诊断。
+4. 在自动打开的专用 Chrome/Edge 中手动访问 `https://chatgpt.com/` 并登录。资料目录位于宿主 `data/plugin_data/astrbot_plugin_browser_chat/`：Chrome 默认 `browser_profile`，Edge 默认 `browser_profile_msedge`；也可用 `browser_profile_name` 指定该根目录内的专用目录名称。与日常浏览器分离；不要把 Cookie、profile 或登录凭据放进 Git。
+5. 在同一账号实际关闭跨会话记忆、引用聊天历史和个人自定义指令，再由管理员发送 `/ask resume 已核验`。该命令是人工确认，不会自动读取或证明这些设置。换号、重新登录后重新核验。普通 `/ask resume` 不会代替人工确认。
+6. 确认状态就绪后使用 `/ask ai 问题`。每次问题创建独立网页会话，默认完成后定向删除；保留策略在任务准入时固定。遇到验证码、登录失效、限流或无法识别的页面会暂停，不绕过限制、不自动重复提交不确定的问题。
+
+本插件只管理自己创建的会话和专用浏览器。QQ 已确认接受或结果未知的消息不会因取消而撤回；会话清理失败独立记录和通知，不把已经成功的答案重发。
+
+## 配置
+
+所有字段与 [_conf_schema.json](_conf_schema.json) 一致。结构配置通过本插件重载生效；已接纳任务使用快照。
+
+| 字段 | 默认值 | 说明 |
+| --- | --- | --- |
+| `restrict_groups` / `allowed_groups` | false / [] | 独立群白名单，启用且空列表时拒绝所有群 |
+| `restrict_users` / `allowed_users` | false / [] | 独立用户白名单；群聊取交集，私聊只检查用户 |
+| `max_concurrency` | 1 | 正整数；大于 1 的真实平台表现需额外验收 |
+| `queue_capacity` | 5 | 非负整数；0 表示不排队 |
+| `execution_timeout_seconds` | 180 | 网页生成预算，不包含发送或清理 |
+| `queue_timeout_seconds` | 600 | 等待截止时间 |
+| `max_input_chars` | 12000 | 当前文字＋直接引用合并后超限拒绝 |
+| `max_reply_chars` / `forward_node_chars` | 12000 / 1500 | 先截断并计入提示，再按段落分段；节点不超过总预算 |
+| `keep_conversations` | false | 是否保留插件自建会话，不改变已接纳任务的策略 |
+| `admin_ids` | [] | QQ 字符串 ID；接收通知且可执行 status/resume，宿主超级管理员也有管理权限 |
+| `user_failure_template` | `任务 {task_id} 失败：{reason}。` | 用户失败提示 |
+| `admin_failure_template` | 分类、任务、来源、时间、原因、次数 | 独立管理员模板，默认无正文 |
+| `browser_channel` | chrome | chrome/msedge；本机 Edge 已通过人工登录和 Playwright 保留登录访问检查，问答/清理另行验收 |
+| `browser_profile_name` | 空字符串 | 按浏览器选择默认目录；显式名称限 1—64 位 ASCII 字母、数字、下划线、短横线，拒绝 Windows 保留名称和路径 |
+
+本机已验证的专用 Edge 配置为 `browser_channel="msedge"`、`browser_profile_name="edge_manual_diagnostic"`，直接复用插件自己的登录目录；不复制个人浏览器资料。旧 `browser_profile` 继续使用 `owned_sessions.json`，其他目录使用 `owned_sessions.<目录名>.json`，恢复清理仅处理所选目录的归属记录。不同进程不能同时占用同一目录；先正常退出本插件的诊断窗口再启动正式插件。浏览器或资料配置修改通过插件重载生效，账号设置仍需人工核验。
+
+模板只允许 `{task_id}`、`{reason}`、`{category}`、`{source}`、`{time}`、`{count}`，不支持属性、下标、转换、非空格式说明或表达式。非法配置不会静默执行。管理员通知按来源平台、浏览器 scope 和故障类别合并 300 秒：首条立即，后续累计，有新增时窗口末补一次汇总；通知失败只记录日志，不递归通知。
+
+## 本轮验收状态
+
+用户已明确指定 Salmon 及测试群/私聊/管理员，具体号码仅用于获准的实时验收，不写入仓库示例配置。2026-10-16 用户确认：专用 Edge 登录成功、Playwright 重开后保留登录且可访问，并已实际关闭记忆、引用聊天历史和自定义指令。原 Chrome 的 CF 根因尚未确定；以上仅证明登录访问，真实问答、会话清理及 QQ 仍待验收。目前尚未向真实 QQ 发送验收消息。
+
+| 场景 | 本轮自动验证 | 真实平台 |
+| --- | --- | --- |
+| 普通提问与单次回答 | 通过：模拟入口＋可控页面 | 未执行：待登录与宿主就绪 |
+| 引用＋问题、仅引用、引用读取失败 | 通过：文字链与错误边界 | 未执行：待指定 QQ 实测 |
+| 群/用户白名单及私聊规则 | 通过：四种开关组合与入口权限 | 未执行：待指定范围抽样 |
+| 1执行＋5等待＋1拒绝、跨来源用户占位 | 通过：受控并发 | 未执行：不制造大量真实请求 |
+| 执行/排队超时、取消、清理占槽 | 通过：受控协程/页面/集成 | 不故意在真实账号制造异常 |
+| 长答案、代码、截断、分段 | 通过：Unicode/预算/稳定长前缀 | 未执行：待一条真实长答案 |
+| 群/私聊合并转发 | 通过：OneBot 替身及实际 SDK语义 | 未执行：待真实 QQ 展示确认 |
+| 明确拒绝降级、超时未知、部分成功 | 通过：接口替身；不重发全文/已确认段 | 不故意制造真实发送故障 |
+| 登录失效、验证码、限流、结构改变 | 通过：可控页面；暂停及安全恢复 | 不故意触发风控 |
+| 管理员多接收者、错平台、异常、合并 | 通过：接口替身及受控 300 秒窗口 | 未执行：待获准私信可达性验证 |
+| 删除、保留、重启残留及原子记录 | 通过：自建会话可控页面与文件测试 | 未执行：待真实自建会话验证 |
+| 插件装载、卸载与新实例生命周期 | 通过：真实 API隔离检查 | 未执行：运行中插件热重载待就绪 |
+| 并发 >1 | 通过：独立本地标签页 | 未执行：默认单并发，不扩展真实压力测试 |
+
+已验证 Windows、Python 3.10.6、Chrome 155.0.8059.79、venv Playwright 1.58.0、aiocqhttp 1.4.4；另一已安装解释器的 Playwright 1.60.0 仅有历史生命周期证据，本轮未重复整套测试。当前源码的 AstrBot 为 4.28.0，声明 Python >=3.12；全局 3.10.6 仅通过隔离 API/过滤链装载，不能据此宣称官方支持 3.10。venv 缺宿主 loguru，未安装或升级宿主依赖。
+
+2026-10-16 Edge 最小接入的针对性回归：资料目录 5 项、插件集成 24 项、生命周期 8 项通过；1 项旧可选 Chrome 用例跳过。临时 Edge 本地页面、取消和重开通过，Ruff 通过。以下 134 项为此前完整回归记录。
+
+本轮完整测试显式包含旧的可选 Chrome 本地生命周期用例，134 项全部通过、无跳过，耗时 192.326 秒。Ruff check/format 通过；完整结果与后续真实验收边界见交接文档。复现命令只访问本地可控页面，使用临时 profile，不发送 QQ：
+
+```powershell
+$env:BROWSER_CHAT_REAL_TEST = '1'
+try {
+    & '..\..\..\venv\Scripts\python.exe' -m unittest discover -s tests -p 'test_*.py' -v
+} finally {
+    Remove-Item Env:BROWSER_CHAT_REAL_TEST
+}
+```
+
+实际限制：生产 ChatGPT 选择器仍需登录后核验，网站语言/布局变化可能导致暂停；保留、删除及账号设置的本地通过不等于真实通过。API 确认接受不等于客户端已展示或用户已读；私信依赖指定机器人可联系管理员。程序不承诺网站额度、不绕过验证码/地区/限流限制。真实 ChatGPT＋QQ 主流程通过前保持“真实接入未通过”。
+
+## Task 4 开发接口与历史检查
 
 `main.py` 通过继承 Star 注册，导入不启动浏览器、不安装依赖。initialize 校验配置并启动专用可见浏览器，默认保持暂停；terminate 停止准入、取消并等待旧任务清理、关闭专用浏览器及全部通知任务，不定义 __del__。
 

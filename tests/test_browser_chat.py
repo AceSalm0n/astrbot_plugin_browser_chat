@@ -17,7 +17,126 @@ from browser_chat import (
 )
 
 
+class BrowserProfileTests(unittest.IsolatedAsyncioTestCase):
+    @unittest.skipUnless(os.name == "nt", "Windows profile name aliases")
+    def test_windows_case_alias_preserves_legacy_registry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            default = ChatGPTBrowser(Path(directory))
+            alias = ChatGPTBrowser(Path(directory), profile_name="BROWSER_PROFILE")
+            self.assertEqual(alias.profile_dir, default.profile_dir)
+            self.assertEqual(alias._registry_path, default._registry_path)
+
+    def test_profile_paths_and_legacy_registry_are_compatible(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            chrome = ChatGPTBrowser(root)
+            edge = ChatGPTBrowser(root, channel="msedge")
+            selected = ChatGPTBrowser(
+                root, channel="msedge", profile_name="edge_manual_diagnostic"
+            )
+            self.assertEqual(chrome.profile_dir, root / "browser_profile")
+            self.assertEqual(chrome._registry_path, root / "owned_sessions.json")
+            self.assertEqual(edge.profile_dir, root / "browser_profile_msedge")
+            self.assertEqual(selected.profile_dir, root / "edge_manual_diagnostic")
+            self.assertEqual(
+                selected._registry_path,
+                root / "owned_sessions.edge_manual_diagnostic.json",
+            )
+
+    def test_invalid_profile_names_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for name in (
+                None,
+                1,
+                "../escape",
+                "a/b",
+                "a\\b",
+                "C:\\x",
+                "a.b",
+                "CON",
+                "nul",
+                "COM1",
+                "LPT9",
+                "a" * 65,
+                "中文",
+            ):
+                with self.subTest(name=name), self.assertRaises(ValueError):
+                    ChatGPTBrowser(Path(directory), profile_name=name)
+
+    def test_profile_directory_link_cannot_escape_data_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            original = Path.resolve
+
+            def resolve(path, *args, **kwargs):
+                if path == root / "linked":
+                    return root.parent / "outside"
+                return original(path, *args, **kwargs)
+
+            with patch.object(Path, "resolve", resolve):
+                with self.assertRaises(ValueError):
+                    ChatGPTBrowser(root, profile_name="linked")
+
+    async def test_registry_isolation_and_retention_survive_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            record = {
+                "task_id": "keep-task",
+                "created_at": "2026-10-15T00:00:00+00:00",
+                "conversation_id": "owned",
+                "url": "https://chatgpt.com/c/owned",
+                "keep": True,
+                "answer_result": "success",
+                "cleanup": "pending",
+                "submission": "confirmed",
+            }
+            payload = json.dumps({"version": 1, "sessions": {"keep-task": record}})
+            legacy = root / "owned_sessions.json"
+            legacy.write_text(payload, encoding="utf-8")
+            edge = ChatGPTBrowser(root, channel="msedge", profile_name="edge_test")
+            self.assertEqual(
+                (await edge.cleanup("keep-task")).status, CleanupStatus.NOT_CREATED
+            )
+            self.assertEqual(legacy.read_text(encoding="utf-8"), payload)
+            edge._registry_path.write_text(payload, encoding="utf-8")
+            restarted = ChatGPTBrowser(root, channel="msedge", profile_name="edge_test")
+            self.assertEqual(
+                (await restarted.cleanup("keep-task")).status, CleanupStatus.RETAINED
+            )
+            self.assertEqual(legacy.read_text(encoding="utf-8"), payload)
+
+
 class BrowserLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    @unittest.skipUnless(
+        os.environ.get("BROWSER_CHAT_EDGE_TEST") == "1", "Opt-in visible Edge test"
+    )
+    async def test_real_edge_profile_restart_and_cancellation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = ChatGPTBrowser(root, channel="msedge", profile_name="edge_test")
+            await first.start()
+            try:
+                page = await first.context.new_page()
+                await page.set_content("<h1>Edge lifecycle</h1>")
+                self.assertEqual(
+                    await page.locator("h1").inner_text(), "Edge lifecycle"
+                )
+                waiting = asyncio.create_task(page.wait_for_timeout(60000))
+                await asyncio.sleep(0)
+                waiting.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await waiting
+            finally:
+                await first.close()
+            second = ChatGPTBrowser(root, channel="msedge", profile_name="edge_test")
+            await second.start()
+            try:
+                self.assertEqual(second.status, BrowserStatus.PAUSED)
+                self.assertEqual(second.pause_reason, "config")
+                self.assertEqual(second.profile_dir, first.profile_dir)
+            finally:
+                await second.close()
+
     def test_unconfirmed_record_cannot_claim_conversation_after_restart(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "owned_sessions.json"

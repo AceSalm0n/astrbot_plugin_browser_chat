@@ -14,6 +14,8 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools
 
 from .browser_chat import (
+    PROFILE_NAME,
+    RESERVED_PROFILE_NAMES,
     BrowserAnswer,
     BrowserError,
     BrowserStatus,
@@ -71,6 +73,7 @@ DEFAULT_CONFIG = {
     "user_failure_template": DEFAULT_USER_TEMPLATE,
     "admin_failure_template": DEFAULT_ADMIN_TEMPLATE,
     "browser_channel": "chrome",
+    "browser_profile_name": "",
 }
 
 
@@ -137,6 +140,13 @@ def validate_config(config: Mapping) -> dict:
             raise ConfigError(key) from None
     if result["browser_channel"] not in ("chrome", "msedge"):
         raise ConfigError("browser_channel")
+    name = result["browser_profile_name"]
+    if (
+        not isinstance(name, str)
+        or PROFILE_NAME.fullmatch(name) is None
+        or name.upper() in RESERVED_PROFILE_NAMES
+    ):
+        raise ConfigError("browser_profile_name")
     return result
 
 
@@ -241,6 +251,7 @@ class BrowserChatPlugin(Star):
                 self.browser = ChatGPTBrowser(
                     StarTools.get_data_dir("astrbot_plugin_browser_chat"),
                     channel=self.settings["browser_channel"],
+                    profile_name=self.settings["browser_profile_name"],
                 )
             await self.browser.start()
             return None
