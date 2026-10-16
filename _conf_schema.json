@@ -1,8 +1,9 @@
 {
   "restrict_groups": {"description": "启用群白名单", "type": "bool", "default": false},
   "allowed_groups": {"description": "允许的群号", "hint": "字符串 ID；启用限制但列表为空时拒绝所有群", "type": "list", "default": []},
-  "restrict_users": {"description": "启用用户白名单", "type": "bool", "default": false},
-  "allowed_users": {"description": "允许的用户 QQ", "hint": "字符串 ID；群聊同时满足启用的两类限制，私聊只检查用户", "type": "list", "default": []},
+  "restrict_users": {"description": "启用用户白名单", "hint": "适用范围由用户白名单作用范围决定", "type": "bool", "default": false},
+  "allowed_users": {"description": "允许的用户 QQ", "hint": "字符串 ID；用户白名单生效的来源中，空列表表示拒绝所有用户", "type": "list", "default": []},
+  "user_allowlist_scope": {"description": "用户白名单作用范围", "hint": "all：群聊和私聊均检查用户白名单（兼容旧配置）；private：仅私聊检查用户白名单，群聊只检查群白名单。希望允许群内全员使用时选择 private", "type": "string", "options": ["all", "private"], "default": "all"},
   "max_concurrency": {"description": "执行并发", "hint": "正整数；默认 1，大于 1 仍需真实平台验收", "type": "int", "default": 1},
   "queue_capacity": {"description": "等待队列容量", "hint": "非负整数；0 表示不排队", "type": "int", "default": 5},
   "execution_timeout_seconds": {"description": "网页执行超时（秒）", "hint": "有限正数；不包含发送和清理预算", "type": "float", "default": 180},

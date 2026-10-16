@@ -61,6 +61,7 @@ DEFAULT_CONFIG = {
     "allowed_groups": [],
     "restrict_users": False,
     "allowed_users": [],
+    "user_allowlist_scope": "all",
     "max_concurrency": 1,
     "queue_capacity": 5,
     "execution_timeout_seconds": 180,
@@ -99,6 +100,9 @@ def validate_config(config: Mapping) -> dict:
     for key in ("restrict_groups", "restrict_users", "keep_conversations"):
         if type(result[key]) is not bool:
             raise ConfigError(key)
+    scope = result["user_allowlist_scope"]
+    if not isinstance(scope, str) or scope not in ("all", "private"):
+        raise ConfigError("user_allowlist_scope")
     for key in ("allowed_groups", "allowed_users", "admin_ids"):
         values = result[key]
         if not isinstance(values, (list, tuple)) or any(

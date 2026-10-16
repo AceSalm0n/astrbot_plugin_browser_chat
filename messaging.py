@@ -54,16 +54,21 @@ def check_access(sender_id: str, group_id: str | None, config: Mapping) -> bool:
         sender_id: A positive ASCII decimal QQ ID string, without whitespace.
         group_id: A QQ group ID string; None or an empty string denotes private chat.
         config: Mapping with boolean restrict_users/restrict_groups and list or
-            tuple allowed_users/allowed_groups. Missing fields default to public.
+            tuple allowed_users/allowed_groups. user_allowlist_scope is all
+            (legacy default) or private. Missing restrictions default to public.
             All supplied restriction fields are validated even when disabled.
 
     Returns:
         Whether access is permitted. Invalid config or IDs return False. Private
-        chats ignore group membership; group chats must pass both enabled lists.
+        chats ignore group membership. Group chats check the user allowlist only
+        in all scope, and always apply an enabled group allowlist.
     """
     if not isinstance(config, Mapping) or not _valid_qq_id(sender_id):
         return False
     if group_id not in (None, "") and not _valid_qq_id(group_id):
+        return False
+    scope = config.get("user_allowlist_scope", "all")
+    if not isinstance(scope, str) or scope not in ("all", "private"):
         return False
     for kind in ("users", "groups"):
         restricted = config.get(f"restrict_{kind}", False)
@@ -74,6 +79,7 @@ def check_access(sender_id: str, group_id: str | None, config: Mapping) -> bool:
             return False
     return (
         not config.get("restrict_users", False)
+        or (scope == "private" and group_id not in (None, ""))
         or sender_id in config.get("allowed_users", [])
     ) and (
         group_id in (None, "")

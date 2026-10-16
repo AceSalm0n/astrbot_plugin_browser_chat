@@ -12,6 +12,17 @@
 
 仅支持文字；不处理图片、附件或嵌套转发，不沿用上一条问题的会话上下文。
 
+## 系统与平台
+
+| 类别 | 支持范围 | 运行条件 |
+| --- | --- | --- |
+| 操作系统 | Windows 11 桌面环境 | 使用已安装的 Chrome 或 Microsoft Edge，能够打开可见浏览器窗口 |
+| 其他系统 | Windows 10、Linux、macOS 尚未验证兼容性 | 不保证直接安装即可运行；仅有终端、没有图形桌面的服务器或容器不能直接使用当前可见浏览器模式 |
+| 消息平台 | QQ 群聊、QQ 私聊 | 通过 AstrBot 的 `aiocqhttp` 适配器连接 OneBot v11，例如 NapCat |
+| 网页服务 | ChatGPT 网页 | 使用专用浏览器资料目录，手动登录并核验账号设置 |
+
+其他消息平台及 QQ 接入适配器尚未适配。Gemini、DeepSeek 等网页服务不在支持范围内。AstrBot 与 QQ 连接端可以独立部署，但运行本插件的主机必须具备上述浏览器和桌面条件。
+
 ## 安装
 
 需要已运行的 AstrBot、QQ OneBot v11 连接（如 NapCat），以及已安装的 Chrome 或 Microsoft Edge。浏览器以可见窗口运行，部署环境需要可用的桌面会话。
@@ -103,8 +114,9 @@
 | --- | --- | --- |
 | `restrict_groups` | `false` | 是否启用群白名单 |
 | `allowed_groups` | `[]` | 允许的群号，填写字符串 ID；启用限制但列表为空时拒绝所有群 |
-| `restrict_users` | `false` | 是否启用用户白名单 |
-| `allowed_users` | `[]` | 允许的用户 QQ，填写字符串 ID；启用限制但列表为空时拒绝所有用户 |
+| `restrict_users` | `false` | 是否启用用户白名单；适用范围由 `user_allowlist_scope` 决定 |
+| `allowed_users` | `[]` | 允许的用户 QQ，填写字符串 ID；用户白名单生效的来源中，空列表表示拒绝所有用户 |
+| `user_allowlist_scope` | `all` | `all`：群聊和私聊；`private`：仅私聊。旧配置缺少此项时按 `all` 处理 |
 | `max_concurrency` | `1` | 同时执行的任务数，必须为正整数 |
 | `queue_capacity` | `5` | 等待位置数量；`0` 表示不排队 |
 | `execution_timeout_seconds` | `180` | 单次网页生成超时，单位秒，不含排队、发送与清理时间 |
@@ -119,7 +131,16 @@
 | `browser_channel` | `chrome` | `chrome` 或 `msedge`，使用系统已安装的浏览器 |
 | `browser_profile_name` | 空字符串 | 专用资料目录名称；留空使用所选浏览器的默认目录 |
 
-群与用户限制互相独立：同时启用时，群聊必须同时满足两类白名单；私聊只检查用户白名单。`admin_ids` 不会绕过提问白名单，宿主超级管理员也可执行管理命令。AstrBot 自身的唤醒、白名单和会话插件开关同样有效。
+群白名单始终只限制群聊。用户白名单开启后的行为由 `user_allowlist_scope` 决定：
+
+| 作用范围 | 群聊 | 私聊 |
+| --- | --- | --- |
+| `all`（默认） | 同时满足启用的群、用户白名单 | 检查用户白名单 |
+| `private` | 只检查群白名单，允许群内所有成员使用 | 检查用户白名单 |
+
+若希望“指定群全员可用，私聊只允许指定用户”，开启 `restrict_groups` 和 `restrict_users`，填写对应的群与用户列表，再将 `user_allowlist_scope` 设为 `private`。关闭群限制时，不再按群号拒绝；关闭用户限制时，不再按发送者 QQ 拒绝。更改作用范围后需重载本插件。
+
+`admin_ids` 不会绕过提问白名单，宿主超级管理员也可执行管理命令。AstrBot 自身的唤醒、白名单和会话插件开关同样有效。
 
 ### 专用资料与会话保留
 
