@@ -25,6 +25,11 @@ test-results/
 .vscode/
 
 
-#agents工作文档
-AGENTS.md
+# Local development files
+/AGENTS.md
+/agent.md
+/tests/
+/docs/
+.agents/
+.codex/
 .claude/

@@ -1,6 +1,6 @@
 name: astrbot_plugin_browser_chat
 display_name: 浏览器问答（开发版）
-desc: 通过专用浏览器进行独立会话问答，提供有界排队、定向清理及 OneBot 发送。真实平台闭环待验收。
+desc: 通过专用浏览器进行独立会话问答，提供有界排队、定向清理及 OneBot 发送。
 version: 0.1.0
 author: AceSalm0n
 repo: https://github.com/AceSalm0n/astrbot_plugin_browser_chat

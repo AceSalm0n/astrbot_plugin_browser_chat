@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import unquote, urljoin, urlsplit
 
 if TYPE_CHECKING:
     from playwright.async_api import BrowserContext, Playwright
@@ -24,17 +24,31 @@ CLOSE_TIMEOUT_SECONDS = 20
 CLEANUP_TIMEOUT_SECONDS = 20
 STABLE_WINDOW_SECONDS = 2
 POLL_INTERVAL_SECONDS = 0.1
+PAGE_READY_TIMEOUT_SECONDS = 12
 
-# Candidate selectors need separate validation against the authenticated site.
-COMPOSER = '#prompt-textarea[contenteditable="true"][role="textbox"]'
-ACCOUNT = '[data-testid="accounts-profile-button"]'
-NEW_CHAT = 'a[aria-label="New chat"]'
-SEND = '[data-testid="send-button"]'
-STOP = '[data-testid="stop-button"]'
-USER = '[data-message-author-role="user"]'
-ASSISTANT = '[data-message-author-role="assistant"]'
-COPY = '[data-testid="copy-turn-action-button"]'
+# Current semantic controls were observed on the authenticated site; retain
+# previous selectors for the local fixtures and older site layouts.
+COMPOSER = (
+    ':is(#prompt-textarea[contenteditable="true"][role="textbox"], '
+    '[contenteditable="true"][role="textbox"][data-composer-markdown]):visible'
+)
+ACCOUNT = ':is([data-testid="accounts-profile-button"], button[aria-label="Open profile menu"]):visible'
+NEW_CHAT = ':is(a[aria-label="New chat"], button:has-text("New chat")):visible'
+SEND = (
+    ':is([data-testid="send-button"], button[type="submit"][aria-label="Send"]):visible'
+)
+STOP = ':is([data-testid="stop-button"], button[aria-label="Stop"]):visible'
+USER = (
+    ':is([data-message-author-role="user"], [data-user-message-bubble="true"]):visible'
+)
+ASSISTANT = ':is([data-message-author-role="assistant"], [data-content-search-unit-key$=":assistant"]):visible'
+COPY = ':is([data-testid="copy-turn-action-button"], button[aria-label="Copy"]):visible'
+ANSWER_BODY = ':is(.markdown, [data-markdown-text-style="assistant-message"])'
 CONVERSATION_ID = re.compile(r"[A-Za-z0-9_-]{1,200}")
+CLIENT_CONVERSATION_ID = re.compile(
+    r"local-chatgpt:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
 PROFILE_NAME = re.compile(r"[A-Za-z0-9_-]{0,64}")
 RESERVED_PROFILE_NAMES = {"CON", "PRN", "AUX", "NUL"} | {
     f"{prefix}{number}" for prefix in ("COM", "LPT") for number in range(1, 10)
@@ -434,11 +448,36 @@ class ChatGPTBrowser:
             ):
                 raise BrowserError("unsupported_region")
         if not account_visible:
-            raise BrowserError("login")
+            # A missing candidate is not evidence of logout: hydration or an
+            # unknown layout must remain a structure failure.
+            raise BrowserError("structure")
         if structure:
-            for selector in (COMPOSER, SEND, NEW_CHAT):
+            # The current site renders Send only after the input is nonempty.
+            for selector in (COMPOSER, NEW_CHAT):
                 if not await page.locator(selector).first.is_visible():
                     raise BrowserError("structure")
+
+    async def _wait_page_ready(self, page):
+        """Wait for visible controls within both local and caller deadlines.
+
+        Args:
+            page: Owned page after navigation or opening a new chat.
+
+        Raises:
+            BrowserError: A definite fault appears or controls remain unknown.
+            asyncio.CancelledError: The owner cancels its bounded operation.
+        """
+        deadline = asyncio.get_running_loop().time() + PAGE_READY_TIMEOUT_SECONDS
+        while True:
+            try:
+                await self._check_page(page, structure=True)
+                return
+            except BrowserError as error:
+                if error.category != "structure":
+                    raise
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise
+            await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
     async def resume(self, *, account_settings_verified: bool = False) -> BrowserStatus:
         """Check residual ownership and visible login before opening admission.
@@ -530,7 +569,7 @@ class ChatGPTBrowser:
         probe = await asyncio.shield(self._opening[self._probe_key])
         self._pages[self._probe_key] = probe
         await probe.goto(self.base_url, wait_until="domcontentloaded")
-        await self._check_page(probe, structure=True)
+        await self._wait_page_ready(probe)
 
     async def ask(
         self, task_id: str, prompt: str, timeout_s: float, *, keep: bool = False
@@ -651,9 +690,9 @@ class ChatGPTBrowser:
         if self._closing:
             raise BrowserError("closed")
         await page.goto(self.base_url, wait_until="domcontentloaded")
-        await self._check_page(page, structure=True)
+        await self._wait_page_ready(page)
         await page.locator(NEW_CHAT).first.click()
-        await self._check_page(page, structure=True)
+        await self._wait_page_ready(page)
         if urlsplit(page.url).path not in ("", "/"):
             raise BrowserError("structure")
         users = await page.locator(USER).count()
@@ -687,17 +726,18 @@ class ChatGPTBrowser:
                     raise BrowserError("submission_unknown", submission_unknown=True)
                 record["submission"] = "confirmed"
                 self._save_records()
+            conversation_pending = False
             if record["submission"] == "confirmed":
                 # URL changes alone cannot establish that this task owns a chat.
-                self._capture_conversation(record, page.url)
+                conversation_pending = self._capture_conversation(record, page.url)
             await self._check_page(page)
             if (
                 record["submission"] == "confirmed"
                 and await page.locator(ASSISTANT).count() > assistants
             ):
                 answer = page.locator(ASSISTANT).nth(assistants)
-                markdown = answer.locator(".markdown:visible")
-                if not await answer.locator(".markdown").count():
+                markdown = answer.locator(ANSWER_BODY + ":visible")
+                if not await answer.locator(ANSWER_BODY).count():
                     if not await page.locator(STOP).first.is_visible():
                         raise BrowserError("structure")
                 elif not await markdown.count():
@@ -719,11 +759,24 @@ class ChatGPTBrowser:
                             ):
                                 parts.append(href)
                     text = "\n".join(parts).strip()
+                    turn = answer.locator(
+                        "xpath=ancestor::*[@data-talvt-turn-state][1]"
+                    )
+                    has_turn = await turn.count() > 0
                     stopped = not await page.locator(STOP).first.is_visible()
-                    complete = await answer.locator(COPY).first.is_visible()
+                    if has_turn:
+                        stopped = stopped and (
+                            await turn.get_attribute("data-talvt-turn-state")
+                            == "complete"
+                        )
+                    complete = (
+                        await (turn if has_turn else answer)
+                        .locator(COPY)
+                        .first.is_visible()
+                    )
                     if text and stopped and not complete:
                         raise BrowserError("structure")
-                    if text and stopped and complete:
+                    if text and stopped and complete and not conversation_pending:
                         now = asyncio.get_running_loop().time()
                         if stable_text != text:
                             stable_text, stable_since = text, now
@@ -734,14 +787,33 @@ class ChatGPTBrowser:
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
     def _capture_conversation(self, record, url):
+        """Capture a canonical URL only after the caller confirms its own prompt.
+
+        Args:
+            record: Current task ownership record.
+            url: Visible URL of the task's own page.
+
+        Returns:
+            True while a known client placeholder still awaits a canonical URL.
+
+        Raises:
+            BrowserError: Origin or conversation identity is unsafe or changed.
+        """
         parsed = urlsplit(url)
         if parsed.hostname == "auth.openai.com":
             raise BrowserError("login")
         if f"{parsed.scheme}://{parsed.netloc}" != self._origin:
             raise BrowserError("browser")
         if not parsed.path.startswith("/c/"):
-            return
+            return False
         conversation_id = parsed.path[3:]
+        if (
+            record["conversation_id"] is None
+            and not parsed.query
+            and not parsed.fragment
+            and CLIENT_CONVERSATION_ID.fullmatch(unquote(conversation_id))
+        ):
+            return True
         if (
             not CONVERSATION_ID.fullmatch(conversation_id)
             or parsed.query
@@ -752,6 +824,7 @@ class ChatGPTBrowser:
         if record["conversation_id"] is None:
             record["conversation_id"], record["url"] = conversation_id, url
             self._save_records()
+        return False
 
     async def cleanup(self, task_id: str, keep: bool | None = None) -> CleanupResult:
         """Share bounded cleanup while respecting the recorded retention policy.
@@ -948,15 +1021,25 @@ class ChatGPTBrowser:
         if page.url != record["url"]:
             return CleanupStatus.CLEANUP_UNKNOWN, "conversation_mismatch"
         await self._check_page(page)
-        await page.get_by_role(
-            "button", name="Conversation options", exact=True
-        ).click()
+        history_entry = page.locator(
+            f'a[href="/c/{record["conversation_id"]}"]:visible'
+        )
+        history_seen = await history_entry.count() > 0
+        await (
+            page.locator("main")
+            .first.get_by_role(
+                "button", name=re.compile(r"^(Conversation options|More)$")
+            )
+            .click()
+        )
         await page.get_by_role("menuitem", name="Delete", exact=True).click()
-        dialog = page.get_by_role("dialog", name="Delete chat", exact=True)
+        dialog = page.get_by_role("dialog", name=re.compile(r"^Delete chat\??$"))
         if page.url != record["url"]:
             return CleanupStatus.CLEANUP_UNKNOWN, "conversation_mismatch"
         self._deleting.add(task_id)
-        await dialog.get_by_role("button", name="Delete", exact=True).click()
+        await dialog.get_by_role(
+            "button", name=re.compile(r"^Delete(?: chat)?$")
+        ).click()
         while True:
             alerts = page.locator('[role="alert"]:visible')
             for index in range(await alerts.count()):
@@ -967,10 +1050,28 @@ class ChatGPTBrowser:
             for index in range(await statuses.count()):
                 if (await statuses.nth(index).inner_text()).strip() == "Chat deleted":
                     confirmed = True
+            # The current UI reloads the empty home without a deletion toast.
+            # Require the previously observed exact history entry to disappear
+            # and the authenticated composer to finish loading after the modal.
+            if (
+                history_seen
+                and page.url == self.base_url
+                and not await dialog.is_visible()
+                and not await history_entry.count()
+            ):
+                try:
+                    await self._check_page(page, structure=True)
+                except BrowserError as error:
+                    if error.category != "structure":
+                        raise
+                else:
+                    if (
+                        not await page.locator(USER).count()
+                        and not await page.locator(ASSISTANT).count()
+                    ):
+                        confirmed = True
             if confirmed and page.url != record["url"]:
-                if not await page.locator(
-                    f'a[href="/c/{record["conversation_id"]}"]:visible'
-                ).count():
+                if not await history_entry.count():
                     return CleanupStatus.DELETED, "deleted"
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
