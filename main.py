@@ -58,6 +58,7 @@ COMMAND_PATTERN = (
     r"cleanup (?:(?:check|retry) [A-Za-z0-9_-]{1,200}|resolve [A-Za-z0-9_-]{1,200} 已核对))\Z"
 )
 READINESS_TIMEOUT_SECONDS = 60
+STARTUP_BINDING_RETRY_DELAYS = (1, 2, 4, 8, 15, 60)
 DEFAULT_CONFIG = {
     "website_provider": "chatgpt",
     "restrict_groups": False,
@@ -186,6 +187,7 @@ class BrowserChatPlugin(Star):
         self._startup_binding_task = None
         self._watchers = set()
         self._delivery = {}
+        self._site_faults = {}
         self._lifecycle = asyncio.Lock()
         self._initialized = False
         self._closing = False
@@ -226,7 +228,12 @@ class BrowserChatPlugin(Star):
             await self.manager.start()
             await self.manager.pause("config" if self.config_error else "starting")
             self._initialized = True
-            await self._bind_startup_platforms()
+            try:
+                await asyncio.wait_for(self._bind_startup_platforms(), timeout=60)
+            except Exception as error:
+                self.logger.warning(
+                    "Startup binding failed: type=%s", type(error).__name__
+                )
             reason = "config" if self.config_error else await self._ensure_ready()
             if reason is None and not self._closing:
                 await self.manager.resume()
@@ -260,21 +267,21 @@ class BrowserChatPlugin(Star):
                 )
 
     async def _retry_startup_bindings(self):
-        deadline = asyncio.get_running_loop().time() + 60
-        for delay in (1, 2, 4, 8, 15, 15, 15):
-            remaining = deadline - asyncio.get_running_loop().time()
-            if remaining <= 0 or self._startup_fault is None or self._closing:
-                return
-            await asyncio.sleep(min(delay, remaining))
+        attempt = 0
+        while self._startup_fault is not None and not self._closing:
+            delay = STARTUP_BINDING_RETRY_DELAYS[
+                min(attempt, len(STARTUP_BINDING_RETRY_DELAYS) - 1)
+            ]
+            attempt += 1
+            await asyncio.sleep(delay)
             if self._startup_fault is None or self._closing:
                 return
-            remaining = deadline - asyncio.get_running_loop().time()
-            if remaining <= 0:
-                return
             try:
-                await asyncio.wait_for(self._bind_startup_platforms(), remaining)
-            except asyncio.TimeoutError:
-                return
+                await asyncio.wait_for(self._bind_startup_platforms(), timeout=60)
+            except Exception as error:
+                self.logger.warning(
+                    "Startup binding retry failed: type=%s", type(error).__name__
+                )
 
     def _schedule_startup_notice(self, platform_id):
         if self._startup_fault is None or platform_id in self._startup_notified:
@@ -417,12 +424,20 @@ class BrowserChatPlugin(Star):
             return
         command = text.split(maxsplit=2)[1]
         settings = self.settings or validate_config({})
+        admin_settings = self._notice_settings or settings
         admin = (
-            event.is_admin() is True or event.get_sender_id() in settings["admin_ids"]
+            event.is_admin() is True
+            or event.get_sender_id() in admin_settings["admin_ids"]
         )
         if command in ("status", "pause", "resume", "cleanup") and not admin:
             await self._reply(event, "没有管理权限。")
             return
+        try:
+            self._bind(OneBotBinding.from_event(event))
+        except Exception as error:
+            self.logger.warning(
+                "Source binding unavailable: type=%s", type(error).__name__
+            )
         if command == "status":
             state = self.manager.snapshot() if self.manager else None
             reason = self.config_error or (state.pause_reason if state else "starting")
@@ -742,6 +757,8 @@ class BrowserChatPlugin(Star):
         except asyncio.TimeoutError:
             job.result, job.reason = JobResult.TIMED_OUT, "timeout"
         except BrowserError as error:
+            if error.site_category:
+                self._site_faults[job.task_id] = error.site_category
             job.result = (
                 JobResult.TIMED_OUT if error.category == "timeout" else JobResult.FAILED
             )
@@ -793,8 +810,11 @@ class BrowserChatPlugin(Star):
                     timeout_s=SEND_TIMEOUT_SECONDS,
                 )
                 if outcome.result != JobResult.CANCELLED and not manual_pause:
+                    admin_fault = Fault(
+                        task_id, route, self._site_faults.get(task_id, category), reason
+                    )
                     await self._notifiers[route.platform_id].notify_failure(
-                        route.platform_id, fault
+                        route.platform_id, admin_fault
                     )
             if outcome.cleanup in (
                 CleanupState.CLEANUP_FAILED,
@@ -812,6 +832,7 @@ class BrowserChatPlugin(Star):
             )
         finally:
             self._delivery.pop(task_id, None)
+            self._site_faults.pop(task_id, None)
 
     async def terminate(self) -> None:
         """Join owned work on unload; concurrent calls share the same shutdown."""

@@ -118,13 +118,29 @@ class BrowserError(RuntimeError):
     Args:
         category: A safe machine-readable diagnostic code.
         submission_unknown: Whether the page may have accepted a submission.
+        site_category: Underlying visible site fault, when separately known.
     """
 
-    def __init__(self, category: str, *, submission_unknown: bool = False) -> None:
+    def __init__(
+        self,
+        category: str,
+        *,
+        submission_unknown: bool = False,
+        site_category: str | None = None,
+    ) -> None:
         if not re.fullmatch(r"[a-z_]+", category):
             raise ValueError("Invalid diagnostic category")
+        if site_category not in (
+            None,
+            "login",
+            "challenge",
+            "rate_limit",
+            "unsupported_region",
+        ):
+            raise ValueError("Invalid site fault category")
         self.category = category
         self.submission_unknown = submission_unknown
+        self.site_category = site_category
         super().__init__(category)
 
 
@@ -1109,14 +1125,18 @@ class ChatGPTBrowser:
             timed_out = isinstance(error, asyncio.TimeoutError)
             record["answer_result"] = "timed_out" if timed_out else "failed"
             category = error.category if isinstance(error, BrowserError) else "browser"
-            if category in ("login", "challenge"):
-                self._pause(category)
+            site_category = (
+                category
+                if category
+                in ("login", "challenge", "rate_limit", "unsupported_region")
+                else None
+            )
             if timed_out:
                 category = "timeout"
             if record["submission"] == "attempted":
                 category = "submission_unknown"
-            if category in ("login", "challenge", "rate_limit", "unsupported_region"):
-                self._pause(category)
+            if site_category:
+                self._pause(site_category)
             elif self.pause_reason not in ("cleanup", "login", "challenge"):
                 self._pause("browser")
             try:
@@ -1128,7 +1148,9 @@ class ChatGPTBrowser:
                     else "submission_unknown"
                 )
             raise BrowserError(
-                category, submission_unknown=record["submission"] == "attempted"
+                category,
+                submission_unknown=record["submission"] == "attempted",
+                site_category=site_category,
             ) from None
         finally:
             self._asks.pop(task_id, None)
@@ -1274,7 +1296,9 @@ class ChatGPTBrowser:
                     record["submission"] = "confirmed"
                     self._save_records()
                 self._capture_conversation(record, page.url)
-            if snapshot.complete:
+            # Default cleanup needs a canonical owned URL; some sites assign it
+            # after the final text is already visible.
+            if snapshot.complete and (record["conversation_id"] or record["keep"]):
                 now = asyncio.get_running_loop().time()
                 if stable_text != snapshot.final_text:
                     stable_text, stable_since = snapshot.final_text, now
