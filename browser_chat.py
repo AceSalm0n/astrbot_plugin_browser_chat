@@ -19,9 +19,21 @@ from typing import TYPE_CHECKING
 from urllib.parse import unquote, urljoin, urlsplit
 
 try:
-    from .site_adapters import COMPOSER, NEW_CHAT, ChatGPTSite, site_data_root
+    from .site_adapters import (
+        COMPOSER,
+        NEW_CHAT,
+        ChatGPTSite,
+        DeepSeekSite,
+        site_data_root,
+    )
 except ImportError:
-    from site_adapters import COMPOSER, NEW_CHAT, ChatGPTSite, site_data_root
+    from site_adapters import (
+        COMPOSER,
+        NEW_CHAT,
+        ChatGPTSite,
+        DeepSeekSite,
+        site_data_root,
+    )
 
 if TYPE_CHECKING:
     from playwright.async_api import BrowserContext, Playwright
@@ -136,6 +148,7 @@ class ChatGPTBrowser:
         base_url: str = "https://chatgpt.com/",
         profile_name: str = "",
         start_minimized: bool = False,
+        provider: str = "chatgpt",
     ) -> None:
         if type(start_minimized) is not bool:
             raise ValueError("Invalid browser window policy")
@@ -150,7 +163,7 @@ class ChatGPTBrowser:
         profile_name = profile_name or (
             "browser_profile" if channel == "chrome" else "browser_profile_msedge"
         )
-        data_root = site_data_root(data_dir, "chatgpt")
+        data_root = site_data_root(data_dir, provider)
         profile_dir = data_root / profile_name
         registry_path = data_root / (
             "owned_sessions.json"
@@ -169,10 +182,11 @@ class ChatGPTBrowser:
             )
         except ValueError:
             loopback = False
+        expected_host = "chatgpt.com" if provider == "chatgpt" else "chat.deepseek.com"
         if (
             parsed.scheme not in ("http", "https")
-            or (parsed.hostname != "chatgpt.com" and not loopback)
-            or (parsed.hostname == "chatgpt.com" and parsed.scheme != "https")
+            or (parsed.hostname != expected_host and not loopback)
+            or (parsed.hostname == expected_host and parsed.scheme != "https")
             or parsed.username is not None
             or parsed.password is not None
             or parsed.path not in ("", "/")
@@ -182,7 +196,10 @@ class ChatGPTBrowser:
             raise ValueError("Unsupported browser origin")
         self.base_url = base_url.rstrip("/") + "/"
         self._origin = f"{parsed.scheme}://{parsed.netloc}"
-        self._site = ChatGPTSite(self._origin, BrowserError)
+        self._site = (ChatGPTSite if provider == "chatgpt" else DeepSeekSite)(
+            self._origin, BrowserError
+        )
+        self.provider = provider
         self.profile_dir = profile_dir
         self._registry_path = registry_path
         self.channel = channel
@@ -572,9 +589,8 @@ class ChatGPTBrowser:
                         raise ValueError
                 elif (
                     not isinstance(conversation_id, str)
-                    or not CONVERSATION_ID.fullmatch(conversation_id)
                     or record["submission"] != "confirmed"
-                    or record["url"] != f"{self._origin}/c/{conversation_id}"
+                    or record["url"] != self._site.conversation_url(conversation_id)
                 ):
                     raise ValueError
                 if payload["version"] == 1:
@@ -629,7 +645,7 @@ class ChatGPTBrowser:
             self._records = payload["sessions"]
             if payload["version"] == 1:
                 self._migration_source = original
-        except (OSError, ValueError, TypeError, KeyError):
+        except (OSError, ValueError, TypeError, KeyError, BrowserError):
             self._registry_valid = False
             self._pause("cleanup")
 
@@ -989,9 +1005,13 @@ class ChatGPTBrowser:
             return CleanupCheckResult(task_id, "unknown")
         if page.url != record["url"]:
             return CleanupCheckResult(task_id, "unavailable")
-        visible = (
-            await page.locator(USER).count() or await page.locator(ASSISTANT).count()
-        )
+        if self.provider == "deepseek":
+            visible = await page.locator(".ds-message:visible").count()
+        else:
+            visible = (
+                await page.locator(USER).count()
+                or await page.locator(ASSISTANT).count()
+            )
         return CleanupCheckResult(task_id, "available" if visible else "unknown")
 
     async def _probe_ready(self):
@@ -1127,6 +1147,8 @@ class ChatGPTBrowser:
         Raises:
             BrowserError: A visible failure or unsupported structure occurs.
         """
+        if self.provider == "deepseek":
+            return await self._ask_deepseek_page(task_id, prompt, deadline)
         record = self._records[task_id]
         page = await self._open_owned_page(task_id, deadline)
         if self._closing:
@@ -1228,6 +1250,40 @@ class ChatGPTBrowser:
                         stable_text, stable_since = None, None
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
+    async def _ask_deepseek_page(self, task_id, prompt, deadline):
+        """Submit one DeepSeek prompt and wait for a stable final answer."""
+        record = self._records[task_id]
+        page = await self._open_owned_page(task_id, deadline)
+        if self._closing:
+            raise BrowserError("closed")
+        await page.goto(self.base_url, wait_until="domcontentloaded")
+        await self._wait_page_ready(page)
+        if page.url != self.base_url:
+            raise BrowserError("structure")
+        users, answers = await self._site.prepare_prompt(page, prompt)
+        if users or answers:
+            raise BrowserError("structure")
+        record["submission"] = "attempted"
+        self._save_records()
+        await self._site.submit_prompt(page)
+        stable_text, stable_since = None, None
+        while True:
+            snapshot = await self._site.inspect_turn(page, prompt, users, answers)
+            if snapshot.submission_confirmed:
+                if record["submission"] != "confirmed":
+                    record["submission"] = "confirmed"
+                    self._save_records()
+                self._capture_conversation(record, page.url)
+            if snapshot.complete:
+                now = asyncio.get_running_loop().time()
+                if stable_text != snapshot.final_text:
+                    stable_text, stable_since = snapshot.final_text, now
+                elif now - stable_since >= STABLE_WINDOW_SECONDS:
+                    return BrowserAnswer(snapshot.final_text, record["conversation_id"])
+            else:
+                stable_text, stable_since = None, None
+            await asyncio.sleep(POLL_INTERVAL_SECONDS)
+
     def _capture_conversation(self, record, url):
         """Capture a canonical URL only after the caller confirms its own prompt.
 
@@ -1241,6 +1297,16 @@ class ChatGPTBrowser:
         Raises:
             BrowserError: Origin or conversation identity is unsafe or changed.
         """
+        if self.provider == "deepseek":
+            conversation_id = self._site.parse_conversation_url(url)
+            if conversation_id is None:
+                return False
+            if record["conversation_id"] not in (None, conversation_id):
+                raise BrowserError("structure")
+            if record["conversation_id"] is None:
+                record["conversation_id"], record["url"] = conversation_id, url
+                self._save_records()
+            return False
         parsed = urlsplit(url)
         if parsed.hostname == "auth.openai.com":
             raise BrowserError("login")
@@ -1478,6 +1544,28 @@ class ChatGPTBrowser:
         if page.url != record["url"]:
             return CleanupStatus.CLEANUP_UNKNOWN, "conversation_mismatch"
         await self._wait_page_ready(page)
+        if self.provider == "deepseek":
+            await self._site.prepare_delete(page, record["url"])
+            record["cleanup_phase"] = "delete_requested"
+            record["cleanup_updated_at"] = datetime.now(timezone.utc).isoformat()
+            try:
+                self._save_records()
+            except BrowserError:
+                record["cleanup_phase"] = "not_started"
+                raise
+            self._deleting.add(task_id)
+            await self._site.confirm_delete(page, record["url"])
+            while True:
+                try:
+                    confirmed = await self._site.deletion_confirmed(page, record["url"])
+                except BrowserError as error:
+                    if error.category != "structure":
+                        raise
+                    confirmed = False
+                if confirmed:
+                    record["cleanup_phase"] = "confirmed"
+                    return CleanupStatus.DELETED, "deleted"
+                await asyncio.sleep(POLL_INTERVAL_SECONDS)
         history_entry = page.locator(
             f'a[href="/c/{record["conversation_id"]}"]:visible'
         )

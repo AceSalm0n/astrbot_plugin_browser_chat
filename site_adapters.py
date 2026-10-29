@@ -52,6 +52,14 @@ class ChatGPTSite:
         self._origin = origin
         self._error = error_type
 
+    def conversation_url(self, conversation_id: str) -> str:
+        """Build the canonical address for a valid ChatGPT conversation ID."""
+        if not isinstance(conversation_id, str) or not re.fullmatch(
+            r"[A-Za-z0-9_-]{1,200}", conversation_id
+        ):
+            raise self._error("structure")
+        return f"{self._origin}/c/{conversation_id}"
+
     async def check_page(self, page, *, structure=False):
         """Inspect visible page health using candidate UI selectors only.
 
