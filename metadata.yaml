@@ -1,6 +1,6 @@
 name: astrbot_plugin_browser_chat
-display_name: 浏览器问答（开发版）
-desc: 通过专用浏览器进行独立会话问答，提供有界排队、定向清理及 OneBot 发送。
+display_name: Browser Chat 网页对话
+desc: 无需 API 密钥，在 QQ 畅聊 ChatGPT 或 DeepSeek 网页版；使用免费账号即可接入，额度以网站规则为准。
 version: 0.1.0
 author: AceSalm0n
 repo: https://github.com/AceSalm0n/astrbot_plugin_browser_chat
