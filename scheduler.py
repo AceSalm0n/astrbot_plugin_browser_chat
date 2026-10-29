@@ -152,6 +152,7 @@ class TaskManager:
         capacity: int = 5,
         queue_timeout_s: float = 600,
         runner: Callable[[Job], Awaitable[None]] | None = None,
+        max_pending_per_user: int = 3,
     ) -> None:
         if type(concurrency) is not int or concurrency <= 0:
             raise ValueError("Concurrency must be a positive integer")
@@ -163,8 +164,11 @@ class TaskManager:
             or queue_timeout_s <= 0
         ):
             raise ValueError("Queue timeout must be finite and positive")
+        if type(max_pending_per_user) is not int or max_pending_per_user < 1:
+            raise ValueError("Per-user limit must be a positive integer")
         if not callable(runner):
             raise ValueError("An async runner is required")
+        self._max_pending_per_user = max_pending_per_user
         self._concurrency = concurrency
         self._capacity = capacity
         self._queue_timeout_s = float(queue_timeout_s)
@@ -175,7 +179,7 @@ class TaskManager:
         self._queued: OrderedDict[str, Job] = OrderedDict()
         self._active: dict[str, tuple[Job, asyncio.Task[None]]] = {}
         self._entered: set[str] = set()
-        self._users: dict[UserKey, str] = {}
+        self._users: dict[UserKey, set[str]] = {}
         self._messages: dict[MessageKey, str] = {}
         self._timers: dict[str, asyncio.TimerHandle] = {}
         self._completion: dict[str, asyncio.Future[JobOutcome]] = {}
@@ -240,7 +244,7 @@ class TaskManager:
             return Admission(False, existing, reason="duplicate_message")
         if job.task_id in self._completion or job.task_id in self._finished:
             return Admission(False, job.task_id, reason="duplicate_task_id")
-        if job.user_key in self._users:
+        if len(self._users.get(job.user_key, ())) >= self._max_pending_per_user:
             return Admission(False, reason="user_busy")
         if (
             len(self._active) >= self._concurrency
@@ -262,7 +266,7 @@ class TaskManager:
             error_type=None,
         )
         self._completion[owned.task_id] = self._loop.create_future()
-        self._users[owned.user_key] = owned.task_id
+        self._users.setdefault(owned.user_key, set()).add(owned.task_id)
         self._messages[owned.dedup_key] = owned.task_id
         self._queued[owned.task_id] = owned
         self._timers[owned.task_id] = self._loop.call_at(
@@ -290,7 +294,13 @@ class TaskManager:
             return self._finished[task_id][1]
         return await asyncio.shield(self._completion[task_id])
 
-    async def cancel(self, user_key: UserKey) -> bool:
+    def pending(self, user_key: UserKey) -> tuple[tuple[str, JobPhase], ...]:
+        """Return this identity's unfinished task IDs and phases."""
+        ids = self._users.get(user_key, set())
+        jobs = list(self._queued.values()) + [job for job, _ in self._active.values()]
+        return tuple((job.task_id, job.phase) for job in jobs if job.task_id in ids)
+
+    async def cancel(self, user_key: UserKey, task_id: str | None = None) -> bool:
         """Cancel one user's task and await active cleanup outside the runner.
 
         Args:
@@ -300,8 +310,12 @@ class TaskManager:
             Whether an unfinished task was found. Cancellation cannot retract
             delivery already confirmed or marked unknown by the runner.
         """
-        task_id = self._users.get(user_key)
+        ids = self._users.get(user_key, set())
         if task_id is None:
+            if len(ids) != 1:
+                return False
+            task_id = next(iter(ids))
+        elif task_id not in ids:
             return False
         if task_id in self._queued:
             current = self._queued.pop(task_id)
@@ -479,7 +493,10 @@ class TaskManager:
         if timer is not None:
             timer.cancel()
         job.phase, job.finished_at = JobPhase.DONE, self._loop.time()
-        self._users.pop(job.user_key)
+        ids = self._users[job.user_key]
+        ids.remove(job.task_id)
+        if not ids:
+            del self._users[job.user_key]
         self._messages.pop(job.dedup_key)
         outcome = JobOutcome(
             job.task_id,
