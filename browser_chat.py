@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import json
+import logging
 import math
 import os
 import re
 import tempfile
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -25,6 +27,8 @@ CLEANUP_TIMEOUT_SECONDS = 20
 STABLE_WINDOW_SECONDS = 2
 POLL_INTERVAL_SECONDS = 0.1
 PAGE_READY_TIMEOUT_SECONDS = 12
+WINDOW_CONTROL_SECONDS = 0.2
+WINDOW_RESERVE_SECONDS = 1
 
 # Current semantic controls were observed on the authenticated site; retain
 # previous selectors for the local fixtures and older site layouts.
@@ -84,6 +88,19 @@ class CleanupResult:
     reason: str = ""
 
 
+@dataclass(frozen=True)
+class CleanupIssue:
+    task_id: str
+    phase: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class CleanupCheckResult:
+    task_id: str
+    state: str
+
+
 class BrowserError(RuntimeError):
     """Expose a fixed diagnostic category without page or request content.
 
@@ -109,6 +126,7 @@ class ChatGPTBrowser:
         channel: Installed Chrome or Edge browser channel.
         base_url: ChatGPT root URL, or a loopback root for local UI tests.
         profile_name: Dedicated directory name; empty selects the channel default.
+        start_minimized: Best-effort Windows window policy; defaults to unchanged UI.
     """
 
     def __init__(
@@ -118,7 +136,10 @@ class ChatGPTBrowser:
         *,
         base_url: str = "https://chatgpt.com/",
         profile_name: str = "",
+        start_minimized: bool = False,
     ) -> None:
+        if type(start_minimized) is not bool:
+            raise ValueError("Invalid browser window policy")
         if channel not in ("chrome", "msedge"):
             raise ValueError("Invalid browser channel")
         if (
@@ -165,6 +186,11 @@ class ChatGPTBrowser:
         self.profile_dir = profile_dir
         self._registry_path = registry_path
         self.channel = channel
+        self.start_minimized = start_minimized
+        self._window_lock = asyncio.Lock()
+        self._window_generation = 0
+        self._window_jobs = set()
+        self._window_warned = False
         self.status = BrowserStatus.PAUSED
         self.pause_reason = "config"
         self.context: BrowserContext | None = None
@@ -173,6 +199,11 @@ class ChatGPTBrowser:
         self._abandon_start = False
         self._lock = asyncio.Lock()
         self._operations = asyncio.Lock()
+        self._cleanup_lock = asyncio.Lock()
+        self._maintenance_task = None
+        self._home_page = None
+        self._home_key = object()
+        self._check_key = object()
         self._closing = False
         self._resuming = False
         self._settings_verified = False
@@ -188,6 +219,7 @@ class ChatGPTBrowser:
         self._records = {}
         self._registry_valid = True
         self._records_dirty = False
+        self._migration_source = None
         self._load_records()
         self._recovery = set(self._records)
 
@@ -232,6 +264,14 @@ class ChatGPTBrowser:
                     ),
                     START_TIMEOUT_SECONDS,
                 )
+                if self.start_minimized and os.name == "nt" and self.context.pages:
+                    self._window_generation += 1
+                    await self._window_call(
+                        self.context.pages[0],
+                        WINDOW_CONTROL_SECONDS,
+                        self._window_generation,
+                        minimize=True,
+                    )
             except BaseException:
                 # A cancelled launch must also stop the owned driver subprocess.
                 await self._release()
@@ -245,7 +285,10 @@ class ChatGPTBrowser:
         Raises:
             Exception: Context or driver shutdown failed or exceeded its timeout.
         """
-        if asyncio.current_task() in self._asks.values():
+        if (
+            asyncio.current_task() in self._asks.values()
+            or asyncio.current_task() is self._maintenance_task
+        ):
             raise RuntimeError("An ask task cannot close its own browser")
         if self._close_task is None or self._close_task.done():
             self._closing = True
@@ -260,6 +303,16 @@ class ChatGPTBrowser:
             Exception: The owned context or driver could not be released.
         """
         try:
+            self._window_generation += 1
+            window_jobs = tuple(self._window_jobs)
+            for job in window_jobs:
+                job.cancel()
+            if window_jobs:
+                await asyncio.wait(window_jobs, timeout=WINDOW_CONTROL_SECONDS)
+            maintenance = self._maintenance_task
+            if maintenance is not None and not maintenance.done():
+                maintenance.cancel()
+                await asyncio.gather(maintenance, return_exceptions=True)
             requests = list(self._asks.values())
             self._closing_requests = set(requests)
             for request in requests:
@@ -293,9 +346,173 @@ class ChatGPTBrowser:
                 self._pages.clear()
                 self._late_closers.clear()
         finally:
+            for job in tuple(self._window_jobs):
+                job.cancel()
+            await asyncio.gather(*tuple(self._window_jobs), return_exceptions=True)
             self._closing = False
             self._closing_requests.clear()
             self._settings_verified = False
+
+    def _window_warning(self):
+        """Report optional UI degradation once without changing business status."""
+        if not self._window_warned:
+            self._window_warned = True
+            logging.getLogger(__name__).warning(
+                "Optional browser window control unavailable"
+            )
+
+    def _window_done(self, task):
+        """Release a tracked control job and observe any late exception."""
+        self._window_jobs.discard(task)
+        if not task.cancelled():
+            task.exception()
+
+    async def _window_rpc(self, page, token, minimize, expected_id):
+        """Inspect or minimize exactly one owned target's browser window.
+
+        Args:
+            page: Page owned by this dedicated context.
+            token: Generation invalidated by overlapping opens or cancellation.
+            minimize: Whether to attempt the optional state change.
+            expected_id: Snapshot window ID, or None for initial startup.
+
+        Returns:
+            Window ID/state snapshot, or None when control is unavailable.
+        """
+        session = None
+        attach = asyncio.create_task(self.context.new_cdp_session(page))
+        self._window_jobs.add(attach)
+        attach.add_done_callback(self._window_done)
+        try:
+            session = await asyncio.shield(attach)
+            result = await session.send("Browser.getWindowForTarget")
+            window_id = result["windowId"]
+            state = result["bounds"]["windowState"]
+            if type(window_id) is not int or state not in (
+                "normal",
+                "minimized",
+                "maximized",
+                "fullscreen",
+            ):
+                raise ValueError("Invalid window state")
+            if (
+                minimize
+                and (expected_id is None or expected_id == window_id)
+                and token == self._window_generation
+                and not self._window_warned
+                and not self._closing
+                and state != "minimized"
+            ):
+                await session.send(
+                    "Browser.setWindowBounds",
+                    {"windowId": window_id, "bounds": {"windowState": "minimized"}},
+                )
+            return window_id, state
+        except Exception:
+            self._window_warning()
+            return None
+        finally:
+            if session is None and not attach.cancelled():
+                try:
+                    session = await asyncio.shield(attach)
+                except Exception:
+                    pass
+            if session is not None:
+                try:
+                    await session.detach()
+                except Exception:
+                    self._window_warning()
+
+    async def _window_call(
+        self, page, budget, token, *, minimize=False, expected_id=None
+    ):
+        """Bound the whole control job, including attach, reads and detach.
+
+        Args:
+            page: Already registered owned page.
+            budget: Remaining shared display allowance in seconds.
+            token: Current page-opening generation.
+            minimize: Whether a state change is allowed.
+            expected_id: Window from the pre-open snapshot.
+
+        Returns:
+            A window snapshot, or None. Caller cancellation propagates.
+        """
+        if budget <= 0:
+            return None
+        task = asyncio.create_task(self._window_rpc(page, token, minimize, expected_id))
+        self._window_jobs.add(task)
+        task.add_done_callback(self._window_done)
+        try:
+            done, _ = await asyncio.wait((task,), timeout=budget)
+            if done:
+                return task.result()
+            self._window_warning()
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if not task.done():
+                self._window_generation += 1
+                task.cancel()
+        return None
+
+    async def _open_owned_page(self, task_id, deadline):
+        """Open and register a real Page before optional display changes.
+
+        Args:
+            task_id: Existing task or private inspection owner.
+            deadline: Original operation deadline; display never borrows disposal time.
+
+        Returns:
+            The registered Page. Optional control failures leave normal behavior.
+        """
+        loop = asyncio.get_running_loop()
+        self._window_generation += 1
+        budget = min(
+            WINDOW_CONTROL_SECONDS,
+            max(0, (deadline - loop.time() - WINDOW_RESERVE_SECONDS) * 0.02),
+        )
+        enabled = (
+            self.start_minimized
+            and os.name == "nt"
+            and not self._window_warned
+            and budget > 0
+        )
+        coordinated = False
+        snapshot = None
+        if enabled:
+            if not self._window_lock.locked():
+                await self._window_lock.acquire()
+                coordinated = True
+        token = self._window_generation
+        try:
+            if coordinated and self.context.pages:
+                started = loop.time()
+                snapshot = await self._window_call(self.context.pages[0], budget, token)
+                budget -= loop.time() - started
+            opening = self._opening.get(task_id)
+            if opening is None:
+                opening = asyncio.create_task(self.context.new_page())
+                self._opening[task_id] = opening
+            page = await asyncio.shield(opening)
+            self._pages[task_id] = page
+            if (
+                snapshot
+                and snapshot[1] == "minimized"
+                and not self._window_warned
+                and token == self._window_generation
+            ):
+                await self._window_call(
+                    page,
+                    min(budget, deadline - loop.time() - WINDOW_RESERVE_SECONDS),
+                    token,
+                    minimize=True,
+                    expected_id=snapshot[0],
+                )
+            return page
+        finally:
+            if coordinated:
+                self._window_lock.release()
 
     def _load_records(self):
         """Reject untrusted ownership files without overwriting their bytes.
@@ -306,12 +523,13 @@ class ChatGPTBrowser:
         if not self._registry_path.exists():
             return
         try:
-            payload = json.loads(self._registry_path.read_text(encoding="utf-8"))
+            original = self._registry_path.read_bytes()
+            payload = json.loads(original.decode("utf-8"))
             if (
                 not isinstance(payload, dict)
                 or set(payload) != {"version", "sessions"}
                 or type(payload["version"]) is not int
-                or payload["version"] != 1
+                or payload["version"] not in (1, 2)
                 or not isinstance(payload["sessions"], dict)
             ):
                 raise ValueError
@@ -325,13 +543,20 @@ class ChatGPTBrowser:
                 "cleanup",
                 "submission",
             }
+            extra = {
+                "cleanup_phase",
+                "cleanup_reason",
+                "cleanup_updated_at",
+                "cleanup_resolution",
+            }
             for task_id, record in payload["sessions"].items():
                 if (
                     not isinstance(task_id, str)
                     or not task_id
                     or len(task_id) > 200
                     or not isinstance(record, dict)
-                    or set(record) != fields
+                    or set(record)
+                    != (fields if payload["version"] == 1 else fields | extra)
                     or record["task_id"] != task_id
                     or type(record["keep"]) is not bool
                     or record["submission"]
@@ -354,7 +579,58 @@ class ChatGPTBrowser:
                     or record["url"] != f"{self._origin}/c/{conversation_id}"
                 ):
                     raise ValueError
+                if payload["version"] == 1:
+                    record.update(
+                        cleanup_phase=(
+                            "not_required"
+                            if record["keep"]
+                            or record["cleanup"] in ("retained", "not_created")
+                            else "confirmed"
+                            if record["cleanup"] == "deleted"
+                            else "legacy_unknown"
+                        ),
+                        cleanup_reason="legacy_record",
+                        cleanup_updated_at=record["created_at"],
+                        cleanup_resolution=None,
+                    )
+                if (
+                    record["cleanup_phase"]
+                    not in (
+                        "not_required",
+                        "not_started",
+                        "delete_requested",
+                        "confirmed",
+                        "legacy_unknown",
+                    )
+                    or not isinstance(record["cleanup_reason"], str)
+                    or re.fullmatch(r"[a-z_]{0,80}", record["cleanup_reason"]) is None
+                    or datetime.fromisoformat(record["cleanup_updated_at"]).tzinfo
+                    is None
+                    or (
+                        record["cleanup_phase"] == "not_required"
+                        and not record["keep"]
+                        and record["cleanup"] != "not_created"
+                    )
+                    or (
+                        record["cleanup"] == "deleted"
+                        and record["cleanup_phase"] != "confirmed"
+                    )
+                ):
+                    raise ValueError
+                resolution = record["cleanup_resolution"]
+                if resolution is not None and (
+                    not isinstance(resolution, dict)
+                    or set(resolution) != {"actor_id", "resolved_at", "action"}
+                    or resolution["action"] != "acknowledged"
+                    or not isinstance(resolution["actor_id"], str)
+                    or re.fullmatch(r"[0-9]{1,20}", resolution["actor_id"]) is None
+                    or not any(c != "0" for c in resolution["actor_id"])
+                    or datetime.fromisoformat(resolution["resolved_at"]).tzinfo is None
+                ):
+                    raise ValueError
             self._records = payload["sessions"]
+            if payload["version"] == 1:
+                self._migration_source = original
         except (OSError, ValueError, TypeError, KeyError):
             self._registry_valid = False
             self._pause("cleanup")
@@ -371,6 +647,18 @@ class ChatGPTBrowser:
         temporary = None
         try:
             self._registry_path.parent.mkdir(parents=True, exist_ok=True)
+            if self._migration_source is not None:
+                with tempfile.NamedTemporaryFile(
+                    mode="wb",
+                    dir=self._registry_path.parent,
+                    prefix=self._registry_path.name + ".v1-backup-",
+                    suffix=".json",
+                    delete=False,
+                ) as backup:
+                    backup.write(self._migration_source)
+                    backup.flush()
+                    os.fsync(backup.fileno())
+                self._migration_source = None
             with tempfile.NamedTemporaryFile(
                 mode="w",
                 encoding="utf-8",
@@ -380,7 +668,7 @@ class ChatGPTBrowser:
                 delete=False,
             ) as handle:
                 temporary = Path(handle.name)
-                json.dump({"version": 1, "sessions": self._records}, handle)
+                json.dump({"version": 2, "sessions": self._records}, handle)
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary, self._registry_path)
@@ -495,6 +783,7 @@ class ChatGPTBrowser:
             if (
                 self._closing
                 or self._resuming
+                or self._maintenance_task is not None
                 or self._asks
                 or self._pages
                 or self._opening
@@ -515,19 +804,13 @@ class ChatGPTBrowser:
                         self._save_records()
                     except BrowserError:
                         return self.status
-                for task_id in tuple(self._recovery):
-                    record = self._records[task_id]
-                    if record["cleanup"] in ("deleted", "retained", "not_created"):
-                        self._recovery.discard(task_id)
-                        continue
-                    result = await self._cleanup_owned(task_id)
-                    if result.status in (
-                        CleanupStatus.CLEANUP_FAILED,
-                        CleanupStatus.CLEANUP_UNKNOWN,
-                    ):
-                        return self.status
-                    self._recovery.discard(task_id)
                 self._settings_verified |= account_settings_verified
+                if self.cleanup_issues():
+                    self._pause("cleanup")
+                    return self.status
+                if any(not task.done() for task in self._late_closers.values()):
+                    self._pause("cleanup")
+                    return self.status
                 if not self._settings_verified:
                     self._pause("config")
                     return self.status
@@ -559,15 +842,236 @@ class ChatGPTBrowser:
         finally:
             self._resuming = False
 
+    def cleanup_issues(self) -> tuple[CleanupIssue, ...]:
+        """Return unresolved ownership metadata without page content or I/O."""
+        return tuple(
+            CleanupIssue(key, record["cleanup_phase"], record["cleanup_reason"])
+            for key, record in sorted(self._records.items())
+            if record["cleanup"] not in ("deleted", "retained", "not_created")
+            and record["cleanup_phase"] != "not_required"
+            and record["cleanup_resolution"] is None
+        )
+
+    @property
+    def cleanup_problem(self) -> str:
+        """Expose a fixed diagnostic code, never a registry path or UI text."""
+        if not self._registry_valid:
+            return "registry_invalid"
+        if self._records_dirty:
+            return "record_write"
+        if (
+            self._pages
+            or self._opening
+            or any(not task.done() for task in self._cleanups.values())
+            or any(not task.done() for task in self._late_closers.values())
+        ):
+            return "resource_pending"
+        return "review_required" if self.cleanup_issues() else ""
+
+    async def open_home(self) -> None:
+        """Open only the dedicated login home, without replaying saved tasks.
+
+        Raises:
+            BrowserError: The context is closed or an earlier page is unresolved.
+        """
+        async with self._lock:
+            if self._closing or self.context is None:
+                raise BrowserError("closed")
+            if self._home_page is not None and not self._home_page.is_closed():
+                return
+            if self._home_key in self._opening or self._home_key in self._pages:
+                raise BrowserError("busy")
+            deadline = asyncio.get_running_loop().time() + START_TIMEOUT_SECONDS
+            page = None
+            try:
+                page = await asyncio.wait_for(
+                    self._open_owned_page(
+                        self._home_key, deadline - START_TIMEOUT_SECONDS * 0.2
+                    ),
+                    START_TIMEOUT_SECONDS * 0.8,
+                )
+                remaining = deadline - asyncio.get_running_loop().time()
+                await asyncio.wait_for(
+                    page.goto(self.base_url, wait_until="domcontentloaded"),
+                    max(0, remaining * 0.9),
+                )
+                self._home_page = page
+                self._opening.pop(self._home_key, None)
+                self._pages.pop(self._home_key, None)
+            finally:
+                if self._home_page is not page or page is None:
+                    await self._dispose_page(self._home_key, deadline)
+            self._pause("cleanup" if self.cleanup_problem else "config")
+
+    @asynccontextmanager
+    async def _maintenance(self, task_id):
+        """Reserve one administrator operation until its resources are joined.
+
+        Args:
+            task_id: Exact registered owner, never a URL or prefix.
+
+        Raises:
+            BrowserError: Invalid ownership, storage, or outstanding work.
+        """
+        async with self._operations:
+            if not self._registry_valid or self._records_dirty:
+                raise BrowserError("cleanup")
+            if not isinstance(task_id, str) or task_id not in self._records:
+                raise BrowserError("not_registered")
+            if (
+                self._closing
+                or self._resuming
+                or self._maintenance_task is not None
+                or self._asks
+                or self._pages
+                or self._opening
+                or any(not task.done() for task in self._cleanups.values())
+                or any(not task.done() for task in self._late_closers.values())
+                or self.status == BrowserStatus.READY
+            ):
+                raise BrowserError("busy")
+            self._maintenance_task = asyncio.current_task()
+            self._pause("cleanup")
+        try:
+            yield self._records[task_id]
+        except BrowserError as error:
+            if error.category in (
+                "login",
+                "challenge",
+                "rate_limit",
+                "unsupported_region",
+            ):
+                self._pause(error.category)
+            raise
+        finally:
+            self._maintenance_task = None
+
+    async def resolve_cleanup(self, task_id: str, actor_id: str) -> None:
+        """Acknowledge one reviewed issue without rewriting its cleanup result.
+
+        Args:
+            task_id: Exact registered task ID.
+            actor_id: Authorized administrator ID checked by the caller.
+
+        Raises:
+            BrowserError: The issue is active, invalid, or cannot be persisted.
+        """
+        if (
+            not isinstance(actor_id, str)
+            or re.fullmatch(r"[0-9]{1,20}", actor_id) is None
+            or not any(c != "0" for c in actor_id)
+        ):
+            raise BrowserError("invalid_actor")
+        async with self._maintenance(task_id) as record:
+            if record["cleanup_resolution"] is not None:
+                return
+            if not any(issue.task_id == task_id for issue in self.cleanup_issues()):
+                raise BrowserError("already_cleaned")
+            record["cleanup_resolution"] = {
+                "actor_id": actor_id,
+                "resolved_at": datetime.now(timezone.utc).isoformat(),
+                "action": "acknowledged",
+            }
+            try:
+                self._save_records()
+            except BrowserError:
+                record["cleanup_resolution"] = None
+                raise
+            self._recovery.discard(task_id)
+
+    async def retry_cleanup(self, task_id: str) -> CleanupResult:
+        """Retry only a known task whose final delete was never attempted.
+
+        Args:
+            task_id: Exact registered task ID.
+
+        Returns:
+            The independently recorded cleanup outcome.
+
+        Raises:
+            BrowserError: Review is required, the browser is busy, or unavailable.
+        """
+        async with self._maintenance(task_id) as record:
+            if (
+                record["cleanup_phase"] != "not_started"
+                or record["cleanup_resolution"] is not None
+            ):
+                raise BrowserError("review_required")
+            if not self._settings_verified:
+                raise BrowserError("settings_unverified")
+            if self.context is None:
+                raise BrowserError("browser")
+            self._cleanups[task_id] = asyncio.create_task(self._cleanup_owned(task_id))
+            return await asyncio.shield(self._cleanups[task_id])
+
+    async def check_cleanup(self, task_id: str) -> CleanupCheckResult:
+        """Inspect one exact owned URL without deletion, submission, or writes.
+
+        Args:
+            task_id: Exact registered task ID.
+
+        Returns:
+            Available, unavailable, or unknown; unavailable never means deleted.
+
+        Raises:
+            BrowserError: The account or browser cannot be safely inspected.
+        """
+        async with self._maintenance(task_id):
+            deadline = asyncio.get_running_loop().time() + CLEANUP_TIMEOUT_SECONDS
+            try:
+                return await asyncio.wait_for(
+                    self._check_cleanup_page(task_id), CLEANUP_TIMEOUT_SECONDS * 0.9
+                )
+            except asyncio.TimeoutError:
+                return CleanupCheckResult(task_id, "unknown")
+            finally:
+                disposed = await self._dispose_page(self._check_key, deadline)
+                if not disposed:
+                    self._pause("cleanup")
+                    raise BrowserError("resource_pending")
+
+    async def _check_cleanup_page(self, task_id):
+        """Read visible controls on a disposable inspection page.
+
+        Args:
+            task_id: Validated owner whose address may be inspected.
+
+        Returns:
+            A content-free inspection result, never proof of deletion.
+        """
+        record = self._records[task_id]
+        if record["url"] is None:
+            return CleanupCheckResult(task_id, "unknown")
+        if self.context is None:
+            raise BrowserError("browser")
+        page = await self._open_owned_page(
+            self._check_key,
+            asyncio.get_running_loop().time() + CLEANUP_TIMEOUT_SECONDS * 0.9,
+        )
+        await page.goto(record["url"], wait_until="domcontentloaded")
+        try:
+            await self._wait_page_ready(page)
+        except BrowserError as error:
+            if error.category != "structure":
+                raise
+            return CleanupCheckResult(task_id, "unknown")
+        if page.url != record["url"]:
+            return CleanupCheckResult(task_id, "unavailable")
+        visible = (
+            await page.locator(USER).count() or await page.locator(ASSISTANT).count()
+        )
+        return CleanupCheckResult(task_id, "available" if visible else "unknown")
+
     async def _probe_ready(self):
         """Inspect a disposable owned page inside resume's total probe budget.
 
         Raises:
             BrowserError: The visible login or required controls are unavailable.
         """
-        self._opening[self._probe_key] = asyncio.create_task(self.context.new_page())
-        probe = await asyncio.shield(self._opening[self._probe_key])
-        self._pages[self._probe_key] = probe
+        probe = await self._open_owned_page(
+            self._probe_key,
+            asyncio.get_running_loop().time() + CLEANUP_TIMEOUT_SECONDS * 0.9,
+        )
         await probe.goto(self.base_url, wait_until="domcontentloaded")
         await self._wait_page_ready(probe)
 
@@ -608,6 +1112,7 @@ class ChatGPTBrowser:
             if (
                 self._closing
                 or self._resuming
+                or self._maintenance_task is not None
                 or self.context is None
                 or self.status != BrowserStatus.READY
                 or not self._registry_valid
@@ -624,6 +1129,10 @@ class ChatGPTBrowser:
                 "answer_result": "pending",
                 "cleanup": "pending",
                 "submission": "not_attempted",
+                "cleanup_phase": "not_started",
+                "cleanup_reason": "",
+                "cleanup_updated_at": datetime.now(timezone.utc).isoformat(),
+                "cleanup_resolution": None,
             }
             self._records[task_id] = record
             self._recovery.add(task_id)
@@ -631,7 +1140,9 @@ class ChatGPTBrowser:
             self._asks[task_id] = asyncio.current_task()
         try:
             remaining = deadline - asyncio.get_running_loop().time()
-            answer = await asyncio.wait_for(self._ask_page(task_id, prompt), remaining)
+            answer = await asyncio.wait_for(
+                self._ask_page(task_id, prompt, deadline), remaining
+            )
             record["answer_result"] = "success"
             self._save_records()
             return answer
@@ -670,12 +1181,13 @@ class ChatGPTBrowser:
         finally:
             self._asks.pop(task_id, None)
 
-    async def _ask_page(self, task_id, prompt):
+    async def _ask_page(self, task_id, prompt, deadline):
         """Run the linear UI flow within ask's single timeout budget.
 
         Args:
             task_id: Registered owner of the newly created page.
             prompt: User input to submit exactly once.
+            deadline: Original generation deadline, including optional window work.
 
         Returns:
             A BrowserAnswer after the current assistant turn is complete.
@@ -684,9 +1196,7 @@ class ChatGPTBrowser:
             BrowserError: A visible failure or unsupported structure occurs.
         """
         record = self._records[task_id]
-        self._opening[task_id] = asyncio.create_task(self.context.new_page())
-        page = await asyncio.shield(self._opening[task_id])
-        self._pages[task_id] = page
+        page = await self._open_owned_page(task_id, deadline)
         if self._closing:
             raise BrowserError("closed")
         await page.goto(self.base_url, wait_until="domcontentloaded")
@@ -887,11 +1397,18 @@ class ChatGPTBrowser:
         reason = "not_registered"
         deadline = asyncio.get_running_loop().time() + CLEANUP_TIMEOUT_SECONDS
         try:
-            status, reason = await asyncio.wait_for(
-                self._cleanup_page(task_id, record), CLEANUP_TIMEOUT_SECONDS * 0.9
-            )
+            async with self._cleanup_lock:
+                # Queue time retains the caller's execution slot. Each active
+                # deletion gets its own bounded UI and page-disposal budget.
+                deadline = asyncio.get_running_loop().time() + CLEANUP_TIMEOUT_SECONDS
+                status, reason = await asyncio.wait_for(
+                    self._cleanup_page(task_id, record), CLEANUP_TIMEOUT_SECONDS * 0.9
+                )
         except asyncio.TimeoutError:
-            status, reason = CleanupStatus.CLEANUP_UNKNOWN, "timeout"
+            if record is not None and record["cleanup_phase"] == "not_started":
+                status, reason = CleanupStatus.CLEANUP_FAILED, "precondition_timeout"
+            else:
+                status, reason = CleanupStatus.CLEANUP_UNKNOWN, "confirmation_timeout"
         except Exception as error:
             if isinstance(error, BrowserError) and error.category in (
                 "login",
@@ -903,7 +1420,13 @@ class ChatGPTBrowser:
                 if task_id in self._deleting
                 else CleanupStatus.CLEANUP_FAILED
             )
-            reason = "confirmation_unknown" if task_id in self._deleting else "browser"
+            reason = (
+                "confirmation_unknown"
+                if task_id in self._deleting
+                else "record_write"
+                if isinstance(error, BrowserError) and error.category == "cleanup"
+                else "browser"
+            )
         finally:
             disposed = await self._dispose_page(task_id, deadline)
             if disposed is None:
@@ -915,6 +1438,10 @@ class ChatGPTBrowser:
             self._pause("cleanup")
         if record is not None and self._registry_valid:
             record["cleanup"] = status.value
+            record["cleanup_reason"] = reason
+            record["cleanup_updated_at"] = datetime.now(timezone.utc).isoformat()
+            if status in (CleanupStatus.RETAINED, CleanupStatus.NOT_CREATED):
+                record["cleanup_phase"] = "not_required"
             try:
                 self._save_records()
             except BrowserError:
@@ -1000,6 +1527,11 @@ class ChatGPTBrowser:
             return CleanupStatus(record["cleanup"]), "already_cleaned"
         if record["keep"]:
             return CleanupStatus.RETAINED, "retained"
+        if (
+            record["cleanup_resolution"] is not None
+            or record["cleanup_phase"] != "not_started"
+        ):
+            return CleanupStatus.CLEANUP_UNKNOWN, "review_required"
         if record["conversation_id"] is None:
             if record["submission"] == "not_attempted":
                 return CleanupStatus.NOT_CREATED, "not_submitted"
@@ -1008,23 +1540,25 @@ class ChatGPTBrowser:
             return CleanupStatus.CLEANUP_FAILED, "browser_closed"
         page = self._pages.get(task_id)
         if page is None or page.is_closed():
-            opening = self._opening.get(task_id)
-            if opening is None:
-                opening = asyncio.create_task(self.context.new_page())
-                self._opening[task_id] = opening
-            page = await asyncio.shield(opening)
-            self._pages[task_id] = page
+            page = await self._open_owned_page(
+                task_id,
+                asyncio.get_running_loop().time() + CLEANUP_TIMEOUT_SECONDS * 0.9,
+            )
             if page.is_closed():
                 return CleanupStatus.CLEANUP_FAILED, "page_closed"
         if page.url != record["url"]:
             await page.goto(record["url"], wait_until="domcontentloaded")
         if page.url != record["url"]:
             return CleanupStatus.CLEANUP_UNKNOWN, "conversation_mismatch"
-        await self._check_page(page)
+        await self._wait_page_ready(page)
         history_entry = page.locator(
             f'a[href="/c/{record["conversation_id"]}"]:visible'
         )
         history_seen = await history_entry.count() > 0
+        while not history_seen:
+            await self._check_page(page)
+            await asyncio.sleep(POLL_INTERVAL_SECONDS)
+            history_seen = await history_entry.count() > 0
         await (
             page.locator("main")
             .first.get_by_role(
@@ -1036,6 +1570,13 @@ class ChatGPTBrowser:
         dialog = page.get_by_role("dialog", name=re.compile(r"^Delete chat\??$"))
         if page.url != record["url"]:
             return CleanupStatus.CLEANUP_UNKNOWN, "conversation_mismatch"
+        record["cleanup_phase"] = "delete_requested"
+        record["cleanup_updated_at"] = datetime.now(timezone.utc).isoformat()
+        try:
+            self._save_records()
+        except BrowserError:
+            record["cleanup_phase"] = "not_started"
+            raise
         self._deleting.add(task_id)
         await dialog.get_by_role(
             "button", name=re.compile(r"^Delete(?: chat)?$")
@@ -1072,6 +1613,7 @@ class ChatGPTBrowser:
                         confirmed = True
             if confirmed and page.url != record["url"]:
                 if not await history_entry.count():
+                    record["cleanup_phase"] = "confirmed"
                     return CleanupStatus.DELETED, "deleted"
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
@@ -1098,6 +1640,7 @@ class ChatGPTBrowser:
             Exception: An owned resource could not be shut down cleanly.
         """
         self._abandon_start = True
+        self._home_page = None
         try:
             try:
                 if self.context is not None:

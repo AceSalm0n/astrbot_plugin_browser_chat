@@ -12,3 +12,6 @@ help: |
   /ask status - 管理员查看状态
   /ask resume - 管理员重新核验网页状态
   /ask resume 已核验 - 人工确认关闭记忆、引用历史和自定义指令后使用
+  /ask cleanup check 任务ID - 管理员只读核查单个会话
+  /ask cleanup retry 任务ID - 管理员重试尚未尝试删除的会话
+  /ask cleanup resolve 任务ID 已核对 - 管理员登记人工确认，不执行删除

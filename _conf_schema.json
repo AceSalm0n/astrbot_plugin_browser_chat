@@ -16,5 +16,6 @@
   "user_failure_template": {"description": "用户失败提示模板", "hint": "允许 task_id/reason/category/source/time/count 简单占位符，不支持属性或表达式", "type": "text", "default": "任务 {task_id} 失败：{reason}。"},
   "admin_failure_template": {"description": "管理员通知模板", "hint": "允许 task_id/reason/category/source/time/count；默认不包含问题或答案", "type": "text", "default": "[BrowserChat] {category}\n任务：{task_id}\n来源：{source}\n时间：{time}\n原因：{reason}\n次数：{count}"},
   "browser_channel": {"description": "专用浏览器", "hint": "Chrome/msedge；使用插件专用资料，不使用个人日常 profile", "type": "string", "options": ["chrome", "msedge"], "default": "chrome"},
-  "browser_profile_name": {"description": "专用资料目录名称", "hint": "留空：Chrome 使用 browser_profile，Edge 使用 browser_profile_msedge。显式名称为 1—64 位英文字母、数字、下划线或短横线，不接受路径或 Windows 保留名称；不同目录的会话归属记录独立", "type": "string", "default": ""}
+  "browser_profile_name": {"description": "专用资料目录名称", "hint": "留空：Chrome 使用 browser_profile，Edge 使用 browser_profile_msedge。显式名称为 1—64 位英文字母、数字、下划线或短横线，不接受路径或 Windows 保留名称；不同目录的会话归属记录独立", "type": "string", "default": ""},
+  "browser_start_minimized": {"description": "尝试最小化运行", "hint": "仅 Windows；默认关闭。保留现有浏览器和登录资料，尽力保持原最小化窗口。新标签可能短暂恢复或抢焦点，不保证完全无弹窗；从任务栏可手动恢复。需重载本插件生效", "type": "bool", "default": false}
 }

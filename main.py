@@ -54,7 +54,8 @@ from .scheduler import (
 )
 
 COMMAND_PATTERN = (
-    r"\A(?:/ask|ask) (?:ai(?=\s|\Z)[\s\S]*|status|resume(?: 已核验)?|cancel)\Z"
+    r"\A(?:/ask|ask) (?:ai(?=\s|\Z)[\s\S]*|status|resume(?: 已核验)?|cancel|"
+    r"cleanup (?:(?:check|retry) [A-Za-z0-9_-]{1,200}|resolve [A-Za-z0-9_-]{1,200} 已核对))\Z"
 )
 DEFAULT_CONFIG = {
     "restrict_groups": False,
@@ -75,6 +76,7 @@ DEFAULT_CONFIG = {
     "admin_failure_template": DEFAULT_ADMIN_TEMPLATE,
     "browser_channel": "chrome",
     "browser_profile_name": "",
+    "browser_start_minimized": False,
 }
 
 
@@ -97,7 +99,12 @@ def validate_config(config: Mapping) -> dict:
     if not isinstance(config, Mapping):
         raise ConfigError("config")
     result = {key: config.get(key, default) for key, default in DEFAULT_CONFIG.items()}
-    for key in ("restrict_groups", "restrict_users", "keep_conversations"):
+    for key in (
+        "restrict_groups",
+        "restrict_users",
+        "keep_conversations",
+        "browser_start_minimized",
+    ):
         if type(result[key]) is not bool:
             raise ConfigError(key)
     scope = result["user_allowlist_scope"]
@@ -220,14 +227,7 @@ class BrowserChatPlugin(Star):
                     )
             reason = await self._start_browser()
             if reason is None and not self._closing:
-                try:
-                    await self.browser.resume()
-                    reason = self.browser.pause_reason or "config"
-                except Exception as error:
-                    self.logger.warning(
-                        "Browser readiness check failed: type=%s", type(error).__name__
-                    )
-                    reason = "browser"
+                reason = "cleanup" if self.browser.cleanup_problem else "config"
             await self.manager.pause(reason or "closed")
             if reason not in (None, "config"):
                 for platform_id, notifier in self._notifiers.items():
@@ -256,8 +256,10 @@ class BrowserChatPlugin(Star):
                     StarTools.get_data_dir("astrbot_plugin_browser_chat"),
                     channel=self.settings["browser_channel"],
                     profile_name=self.settings["browser_profile_name"],
+                    start_minimized=self.settings["browser_start_minimized"],
                 )
             await self.browser.start()
+            await self.browser.open_home()
             return None
         except Exception as error:
             dependency = isinstance(error, ImportError) or (
@@ -284,6 +286,31 @@ class BrowserChatPlugin(Star):
                 "Command acknowledgement unconfirmed: type=%s", type(error).__name__
             )
 
+    def _cleanup_summary(self):
+        """Render safe issue metadata for administrator status and recovery."""
+        if self.browser is None:
+            return "清理诊断不可用，请检查浏览器依赖及配置。"
+        problem = self.browser.cleanup_problem
+        issues = self.browser.cleanup_issues()
+        lines = ["仍暂停（cleanup）：网页会话清理待处理。"]
+        if problem == "registry_invalid":
+            lines.append("归属文件无效；请保留原文件并检查备份，不能通过核销绕过。")
+        elif problem == "record_write":
+            lines.append("归属记录写入未完成；请检查文件权限和磁盘，不能通过核销绕过。")
+        elif problem == "resource_pending":
+            lines.append("旧浏览器页面仍在关闭，请等待资源释放后再处理。")
+        for issue in issues[:5]:
+            lines.append(
+                f"任务：{issue.task_id}；阶段：{issue.phase}；原因：{issue.reason or 'pending'}"
+            )
+        if len(issues) > 5:
+            lines.append(f"另有 {len(issues) - 5} 条待处理记录。")
+        if issues:
+            lines.append(
+                "使用 /ask cleanup check <任务ID> 只读核查；已人工处理或接受该条遗留后，使用 /ask cleanup resolve <任务ID> 已核对。未尝试删除的任务可用 /ask cleanup retry <任务ID> 重试。处理后再执行 /ask resume 已核验。"
+            )
+        return "\n".join(lines)
+
     @filter.regex(COMMAND_PATTERN)
     async def on_command(self, event: AstrMessageEvent):
         """Claim precise commands before awaiting; stop the default LLM pipeline.
@@ -305,7 +332,7 @@ class BrowserChatPlugin(Star):
         admin = (
             event.is_admin() is True or event.get_sender_id() in settings["admin_ids"]
         )
-        if command in ("status", "resume") and not admin:
+        if command in ("status", "resume", "cleanup") and not admin:
             await self._reply(event, "没有管理权限。")
             return
         if command == "status":
@@ -318,11 +345,96 @@ class BrowserChatPlugin(Star):
                     state.running if state else 0,
                     state.queued if state else 0,
                     reason or "ready",
-                ),
+                )
+                + ("\n" + self._cleanup_summary() if reason == "cleanup" else ""),
             )
             return
         if self._closing or not self._initialized or self.config_error:
             await self._reply(event, "服务未就绪，请管理员检查配置并重载本插件。")
+            return
+        if command == "cleanup":
+            async with self._lifecycle:
+                state = self.manager.snapshot()
+                if (
+                    self._closing
+                    or state.running
+                    or state.queued
+                    or state.state != ManagerState.PAUSED
+                ):
+                    await self._reply(
+                        event, "请在服务暂停且旧任务退出、清理完成后再处理记录。"
+                    )
+                    return
+                if self.browser is None:
+                    await self._reply(event, "浏览器模块不可用，请先检查依赖及配置。")
+                    return
+                _, _, action, task_id, *_ = text.split()
+                try:
+                    if action == "check":
+                        result = await self.browser.check_cleanup(task_id)
+                        descriptions = {
+                            "available": "会话当前可访问",
+                            "unavailable": "会话地址当前不可用，不代表已删除",
+                            "unknown": "无法确认会话状态",
+                        }
+                        reply = (
+                            descriptions[result.state]
+                            + "；本次未删除、未提问，原清理结果不变。"
+                        )
+                    elif action == "retry":
+                        binding = OneBotBinding.from_event(event)
+                        self._bind(binding)
+                        result = await self.browser.retry_cleanup(task_id)
+                        reply = f"清理结果：{result.status.value}；原因：{result.reason or 'none'}。未重发问题或答案；请核对后使用 /ask resume 已核验。"
+                        if result.status in (
+                            CleanupStatus.CLEANUP_FAILED,
+                            CleanupStatus.CLEANUP_UNKNOWN,
+                        ):
+                            group = event.get_group_id()
+                            route = SourceRoute(
+                                binding.platform_id,
+                                "group" if group else "private",
+                                group or event.get_sender_id(),
+                                binding,
+                            )
+                            try:
+                                await self._notifiers[
+                                    binding.platform_id
+                                ].notify_failure(
+                                    binding.platform_id,
+                                    Fault(task_id, route, "cleanup", result.reason),
+                                )
+                            except Exception as error:
+                                self.logger.warning(
+                                    "Cleanup notice failed: type=%s",
+                                    type(error).__name__,
+                                )
+                    else:
+                        await self.browser.resolve_cleanup(
+                            task_id, event.get_sender_id()
+                        )
+                        reply = "已记录人工核对，该条记录不再阻止恢复；原清理结果不变，本次未执行删除。请使用 /ask resume 已核验 重新检查。"
+                except BrowserError as error:
+                    descriptions = {
+                        "busy": "旧任务、页面或管理操作仍在退出，请稍后重试。",
+                        "not_registered": "没有这条归属记录，请填写完整任务ID。",
+                        "review_required": "该任务可能已尝试删除，或已核销；禁止自动重试，请先核查。",
+                        "already_cleaned": "该记录无需核销。",
+                        "settings_unverified": "请先人工核验账号设置并执行 /ask resume 已核验，再重试清理。",
+                        "resource_pending": "核查页面仍未关闭，请等待资源释放。",
+                        "login": "专用浏览器登录已失效，请手动登录并重新核验账号设置。",
+                        "challenge": "请在专用浏览器手动处理验证后再恢复。",
+                    }
+                    reply = descriptions.get(
+                        error.category,
+                        f"清理操作未完成（{error.category}），请查看 /ask status。",
+                    )
+                except Exception as error:
+                    self.logger.warning(
+                        "Cleanup command failed: type=%s", type(error).__name__
+                    )
+                    reply = "清理操作结果未确认，请查看 /ask status；不要重复提交删除。"
+                await self._reply(event, reply)
             return
         if command == "resume":
             async with self._lifecycle:
@@ -350,18 +462,23 @@ class BrowserChatPlugin(Star):
                         self.logger.warning(
                             "Browser resume failed: type=%s", type(error).__name__
                         )
-                        reason = "browser"
+                        reason = (
+                            "cleanup" if self.browser.cleanup_problem else "browser"
+                        )
                 if reason is None and not self._closing:
                     await self.manager.resume()
                     await self._reply(event, "网页就绪检查通过，已恢复接单。")
                 else:
                     await self.manager.pause(reason or "closed")
-                    await self._reply(
-                        event,
-                        "仍暂停（{}）。请在专用浏览器手动登录，关闭记忆、引用聊天历史和自定义指令；实际核验后使用 /ask resume 已核验。依赖缺失时请用宿主解释器安装 requirements.txt。".format(
-                            reason or "closed"
-                        ),
-                    )
+                    if reason == "cleanup":
+                        await self._reply(event, self._cleanup_summary())
+                    else:
+                        await self._reply(
+                            event,
+                            "仍暂停（{}）。请在专用浏览器手动登录，关闭记忆、引用聊天历史和自定义指令；实际核验后使用 /ask resume 已核验。依赖缺失时请用宿主解释器安装 requirements.txt。".format(
+                                reason or "closed"
+                            ),
+                        )
             return
         if command == "cancel":
             found = await self.manager.cancel(
