@@ -1,5 +1,6 @@
 """Site-specific visible controls for browser chat."""
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit
@@ -114,6 +115,32 @@ class DeepSeekSite:
     def __init__(self, origin, error_type):
         self._origin = origin
         self._error = error_type
+
+    def conversation_url(self, conversation_id: str) -> str:
+        """Build a canonical URL only for an observed DeepSeek UUID."""
+        if not isinstance(conversation_id, str) or not re.fullmatch(
+            r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}",
+            conversation_id,
+        ):
+            raise self._error("structure")
+        return f"{self._origin}/a/chat/s/{conversation_id}"
+
+    def parse_conversation_url(self, url: str) -> str | None:
+        """Accept only this site's root or an exact canonical session address."""
+        parsed = urlsplit(url)
+        if f"{parsed.scheme}://{parsed.netloc}" != self._origin:
+            raise self._error("browser")
+        if parsed.query or parsed.fragment:
+            raise self._error("structure")
+        if parsed.path in ("", "/"):
+            return None
+        prefix = "/a/chat/s/"
+        if not parsed.path.startswith(prefix):
+            raise self._error("structure")
+        conversation_id = parsed.path[len(prefix) :]
+        if self.conversation_url(conversation_id) != url:
+            raise self._error("structure")
+        return conversation_id
 
     async def check_page(self, page, *, structure=False):
         """Fail closed on unrecognized origins, login forms, and missing input."""
