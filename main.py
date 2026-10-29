@@ -240,13 +240,21 @@ class BrowserChatPlugin(Star):
             else:
                 await self.manager.pause(reason or "closed")
             if reason is not None:
-                self._startup_fault = Fault("startup", None, reason, reason)
-                for platform_id in self._notifiers:
-                    self._schedule_startup_notice(platform_id)
-                if self._notice_settings["admin_ids"]:
-                    self._startup_binding_task = asyncio.create_task(
-                        self._retry_startup_bindings()
-                    )
+                self._publish_startup_fault(reason)
+
+    def _publish_startup_fault(self, reason):
+        """Keep late platform notices aligned with the latest readiness fault."""
+        if self._startup_fault is None or self._startup_fault.category != reason:
+            self._startup_fault = Fault("startup", None, reason, reason)
+            self._startup_notified.clear()
+        for platform_id in self._notifiers:
+            self._schedule_startup_notice(platform_id)
+        if self._notice_settings["admin_ids"] and (
+            self._startup_binding_task is None or self._startup_binding_task.done()
+        ):
+            self._startup_binding_task = asyncio.create_task(
+                self._retry_startup_bindings()
+            )
 
     async def _bind_startup_platforms(self):
         """Bind only enabled OneBot instances whose identities are confirmed."""
@@ -569,11 +577,17 @@ class BrowserChatPlugin(Star):
                     self._startup_fault = None
                     if self._startup_binding_task:
                         self._startup_binding_task.cancel()
+                        await asyncio.gather(
+                            self._startup_binding_task, return_exceptions=True
+                        )
+                        self._startup_binding_task = None
                     for task in tuple(self._startup_notice_tasks):
                         task.cancel()
                     await self._reply(event, "网页就绪检查通过，已恢复接单。")
                 else:
                     await self.manager.pause(reason or "closed")
+                    if reason and not self._closing:
+                        self._publish_startup_fault(reason)
                     if reason == "cleanup":
                         await self._reply(event, self._cleanup_summary())
                     else:
