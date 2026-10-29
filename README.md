@@ -1,3 +1,5 @@
+![Browser Chat 插件封面](cover.png)
+
 # 🌐 Browser Chat 网页对话
 
 让 QQ 接入 **ChatGPT 或 DeepSeek 网页版**：通过专用 Chrome 或 Edge 提问，把网页回答发送到群聊或私聊。无需配置模型 API 密钥，也不按 API 调用计费；支持使用网站提供的免费账号。
