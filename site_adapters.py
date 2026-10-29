@@ -155,6 +155,77 @@ class DeepSeekSite:
         if structure and await page.locator("textarea:visible").count() != 1:
             raise self._error("structure")
 
+    async def prepare_prompt(self, page, prompt):
+        """Fill the prompt while leaving submission and mode toggles untouched."""
+        await self.check_page(page, structure=True)
+        user_baseline = await page.locator(".ds-message.d29f3d7d:visible").count()
+        answer_baseline = await page.locator(
+            ".ds-assistant-message-main-content:visible"
+        ).count()
+        await page.locator("textarea:visible").first.fill(prompt)
+        return user_baseline, answer_baseline
+
+    async def submit_prompt(self, page):
+        """Submit once; the caller records intent before invoking this method."""
+        await page.locator("textarea:visible").first.press("Enter")
+
+    async def prepare_delete(self, page, conversation_url):
+        """Open the owned conversation's confirmation without deleting it."""
+        conversation_id = self.parse_conversation_url(conversation_url)
+        if conversation_id is None or page.url != conversation_url:
+            raise self._error("structure")
+        entry = page.locator(f'a[href="/a/chat/s/{conversation_id}"]:visible')
+        if await entry.count() != 1:
+            raise self._error("structure")
+        options = entry.locator("[role=button]")
+        if await options.count() != 1:
+            raise self._error("structure")
+        await entry.hover()
+        await options.click()
+        delete = page.locator(".ds-dropdown-menu-option--error:visible").get_by_text(
+            "删除", exact=True
+        )
+        if await delete.count() != 1:
+            raise self._error("structure")
+        await delete.click()
+        modal = page.locator(".ds-modal:visible")
+        confirmation = modal.get_by_role("button", name="删除该对话", exact=True)
+        if (
+            page.url != conversation_url
+            or await entry.count() != 1
+            or await modal.count() != 1
+            or await confirmation.count() != 1
+        ):
+            raise self._error("structure")
+
+    async def confirm_delete(self, page, conversation_url):
+        """Click once after the owner persisted deletion intent."""
+        conversation_id = self.parse_conversation_url(conversation_url)
+        if conversation_id is None or page.url != conversation_url:
+            raise self._error("structure")
+        entry = page.locator(f'a[href="/a/chat/s/{conversation_id}"]:visible')
+        modal = page.locator(".ds-modal:visible")
+        confirmation = modal.get_by_role("button", name="删除该对话", exact=True)
+        if (
+            await entry.count() != 1
+            or await modal.count() != 1
+            or await confirmation.count() != 1
+        ):
+            raise self._error("structure")
+        await confirmation.click()
+
+    async def deletion_confirmed(self, page, conversation_url):
+        """Check exact-entry disappearance and an authenticated empty home."""
+        conversation_id = self.parse_conversation_url(conversation_url)
+        if conversation_id is None or page.url != self._origin + "/":
+            return False
+        if await page.locator(".ds-modal:visible").count():
+            return False
+        if await page.locator(f'a[href="/a/chat/s/{conversation_id}"]').count():
+            return False
+        await self.check_page(page, structure=True)
+        return await page.locator(".ds-message:visible").count() == 0
+
     async def inspect_turn(self, page, prompt, user_baseline, answer_baseline):
         """Read the submitted user turn and only the visible final answer.
 
