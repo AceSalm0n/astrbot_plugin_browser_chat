@@ -164,7 +164,7 @@ Windows 上可将 `browser_start_minimized` 设为 `true`，重载本插件后�
 
 专用资料位于宿主 `data/plugin_data/astrbot_plugin_browser_chat/`：
 
-ChatGPT 使用该目录原有路径；DeepSeek 的资料和归属记录位于 `sites/deepseek/` 下，对应的浏览器与资料名称按以下相同规则解析。切换站点不会处理另一个站点的遗留记录。
+ChatGPT 使用该目录原有路径；DeepSeek 的资料和归属记录位于 `.sites/deepseek/` 下，对应的浏览器与资料名称按以下相同规则解析。切换站点不会处理另一个站点的遗留记录。
 
 - Chrome 默认目录：`browser_profile/`。
 - Edge 默认目录：`browser_profile_msedge/`。

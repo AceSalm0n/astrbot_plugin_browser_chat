@@ -31,7 +31,9 @@ def site_data_root(data_dir: Path, provider: str) -> Path:
         return root
     if provider != "deepseek":
         raise ValueError("Unsupported site")
-    target = (root / "sites" / "deepseek").resolve()
+    # A leading dot cannot be a valid legacy browser_profile_name, so this
+    # namespace cannot overlap a ChatGPT profile even when named "sites".
+    target = (root / ".sites" / "deepseek").resolve()
     if target == root or not target.is_relative_to(root):
         raise ValueError("Site data path escapes plugin data directory")
     return target
