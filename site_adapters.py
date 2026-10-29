@@ -160,6 +160,25 @@ class DeepSeekSite:
             raise self._error("login")
         if "just a moment" in (await page.title()).lower():
             raise self._error("challenge")
+        alerts = page.locator(
+            '[role="alert"]:visible, .ds-alert:visible, .ds-toast:visible'
+        )
+        for index in range(await alerts.count()):
+            alert = alerts.nth(index)
+            if await alert.locator(
+                'xpath=ancestor-or-self::*[contains(concat(" ", normalize-space(@class), " "), " ds-message ")]'
+            ).count():
+                continue
+            message = (await alert.inner_text()).lower()
+            if any(
+                word in message
+                for word in ("too many requests", "rate limit", "请求过于频繁")
+            ):
+                raise self._error("rate_limit")
+            if any(
+                word in message for word in ("verify you are human", "请完成安全验证")
+            ):
+                raise self._error("challenge")
         if structure and await page.locator("textarea:visible").count() != 1:
             raise self._error("structure")
 
