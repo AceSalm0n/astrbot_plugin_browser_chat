@@ -57,6 +57,7 @@ COMMAND_PATTERN = (
     r"\A(?:/ask|ask) (?:ai(?=\s|\Z)[\s\S]*|status|pause|resume(?: 已核验)?|cancel|"
     r"cleanup (?:(?:check|retry) [A-Za-z0-9_-]{1,200}|resolve [A-Za-z0-9_-]{1,200} 已核对))\Z"
 )
+READINESS_TIMEOUT_SECONDS = 60
 DEFAULT_CONFIG = {
     "restrict_groups": False,
     "allowed_groups": [],
@@ -173,6 +174,11 @@ class BrowserChatPlugin(Star):
         self.manager = None
         self._bindings = {}
         self._notifiers = {}
+        self._notice_settings = None
+        self._startup_fault = None
+        self._startup_notified = set()
+        self._startup_notice_tasks = set()
+        self._startup_binding_task = None
         self._watchers = set()
         self._delivery = {}
         self._lifecycle = asyncio.Lock()
@@ -193,6 +199,19 @@ class BrowserChatPlugin(Star):
                     "Invalid browser-chat configuration field: %s", self.config_error
                 )
             settings = self.settings or validate_config({})
+            self._notice_settings = self.settings
+            if self.config_error:
+                try:
+                    self._notice_settings = validate_config(
+                        {"admin_ids": self._raw_config.get("admin_ids", [])}
+                    )
+                except (AttributeError, ConfigError):
+                    self._notice_settings = validate_config({})
+                    self.logger.warning(
+                        "Administrator IDs unavailable for startup notice"
+                    )
+            if not self._notice_settings["admin_ids"]:
+                self.logger.warning("Administrator notifications are not configured")
             self.manager = TaskManager(
                 settings["max_concurrency"],
                 settings["queue_capacity"],
@@ -202,38 +221,95 @@ class BrowserChatPlugin(Star):
             await self.manager.start()
             await self.manager.pause("config" if self.config_error else "starting")
             self._initialized = True
-            if self.config_error:
-                return
-            # Startup faults have no event. Identify only enabled OneBot instances
-            # using their public API, never a random client UUID or another bot.
-            platform_manager = getattr(self.context, "platform_manager", None)
-            for platform in platform_manager.get_insts() if platform_manager else ():
-                if platform.meta().name != "aiocqhttp":
-                    continue
-                try:
-                    client = platform.get_client()
-                    identity = await asyncio.wait_for(
-                        client.call_action("get_login_info"), 5
-                    )
-                    self._bind(
-                        OneBotBinding(
-                            platform.meta().id, str(identity["user_id"]), client
-                        )
-                    )
-                except Exception as error:
-                    self.logger.warning(
-                        "OneBot startup identity unavailable: type=%s",
-                        type(error).__name__,
-                    )
-            reason = await self._start_browser()
+            await self._bind_startup_platforms()
+            reason = "config" if self.config_error else await self._ensure_ready()
             if reason is None and not self._closing:
-                reason = "cleanup" if self.browser.cleanup_problem else "config"
-            await self.manager.pause(reason or "closed")
-            if reason not in (None, "config"):
-                for platform_id, notifier in self._notifiers.items():
-                    await notifier.notify_failure(
-                        platform_id, Fault("startup", None, reason, reason)
+                await self.manager.resume()
+            else:
+                await self.manager.pause(reason or "closed")
+            if reason is not None:
+                self._startup_fault = Fault("startup", None, reason, reason)
+                for platform_id in self._notifiers:
+                    self._schedule_startup_notice(platform_id)
+                if self._notice_settings["admin_ids"]:
+                    self._startup_binding_task = asyncio.create_task(
+                        self._retry_startup_bindings()
                     )
+
+    async def _bind_startup_platforms(self):
+        """Bind only enabled OneBot instances whose identities are confirmed."""
+        manager = getattr(self.context, "platform_manager", None)
+        for platform in manager.get_insts() if manager else ():
+            try:
+                meta = platform.meta()
+                if meta.name != "aiocqhttp" or meta.id in self._bindings:
+                    continue
+                client = platform.get_client()
+                identity = await asyncio.wait_for(
+                    client.call_action("get_login_info"), 5
+                )
+                self._bind(OneBotBinding(meta.id, str(identity["user_id"]), client))
+            except Exception as error:
+                self.logger.warning(
+                    "OneBot startup identity unavailable: type=%s", type(error).__name__
+                )
+
+    async def _retry_startup_bindings(self):
+        deadline = asyncio.get_running_loop().time() + 60
+        for delay in (1, 2, 4, 8, 15, 15, 15):
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0 or self._startup_fault is None or self._closing:
+                return
+            await asyncio.sleep(min(delay, remaining))
+            if self._startup_fault is None or self._closing:
+                return
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                return
+            try:
+                await asyncio.wait_for(self._bind_startup_platforms(), remaining)
+            except asyncio.TimeoutError:
+                return
+
+    def _schedule_startup_notice(self, platform_id):
+        if self._startup_fault is None or platform_id in self._startup_notified:
+            return
+        self._startup_notified.add(platform_id)
+        fault = self._startup_fault
+
+        async def send():
+            if self._startup_fault is fault and not self._closing:
+                await self._notifiers[platform_id].notify_failure(platform_id, fault)
+
+        task = asyncio.create_task(send())
+        self._startup_notice_tasks.add(task)
+        task.add_done_callback(self._startup_notice_tasks.discard)
+
+    async def _ensure_ready(self):
+        """Run the same bounded readiness check at startup and manual resume."""
+
+        async def check():
+            reason = await self._start_browser()
+            if reason is not None or self._closing:
+                return reason or "closed"
+            status = await self.browser.resume()
+            if status == BrowserStatus.READY:
+                return None
+            return self.browser.pause_reason or "browser"
+
+        try:
+            return await asyncio.wait_for(check(), READINESS_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            return "timeout"
+        except Exception as error:
+            self.logger.warning(
+                "Browser readiness failed: type=%s", type(error).__name__
+            )
+            return (
+                "cleanup"
+                if self.browser and self.browser.cleanup_problem
+                else "browser"
+            )
 
     def _bind(self, binding: OneBotBinding) -> None:
         """Retain one exact source account and one notifier per enabled instance."""
@@ -245,9 +321,10 @@ class BrowserChatPlugin(Star):
         self._bindings[binding.platform_id] = binding
         self._notifiers[binding.platform_id] = FailureNotifier(
             {binding.platform_id: binding},
-            self.settings["admin_ids"],
-            admin_failure_template=self.settings["admin_failure_template"],
+            self._notice_settings["admin_ids"],
+            admin_failure_template=self._notice_settings["admin_failure_template"],
         )
+        self._schedule_startup_notice(binding.platform_id)
 
     async def _start_browser(self):
         try:
@@ -307,7 +384,7 @@ class BrowserChatPlugin(Star):
             lines.append(f"另有 {len(issues) - 5} 条待处理记录。")
         if issues:
             lines.append(
-                "使用 /ask cleanup check <任务ID> 只读核查；已人工处理或接受该条遗留后，使用 /ask cleanup resolve <任务ID> 已核对。未尝试删除的任务可用 /ask cleanup retry <任务ID> 重试。处理后再执行 /ask resume 已核验。"
+                "使用 /ask cleanup check <任务ID> 只读核查；已人工处理或接受该条遗留后，使用 /ask cleanup resolve <任务ID> 已核对。未尝试删除的任务可用 /ask cleanup retry <任务ID> 重试。处理后再执行 /ask resume。"
             )
         return "\n".join(lines)
 
@@ -398,7 +475,7 @@ class BrowserChatPlugin(Star):
                         binding = OneBotBinding.from_event(event)
                         self._bind(binding)
                         result = await self.browser.retry_cleanup(task_id)
-                        reply = f"清理结果：{result.status.value}；原因：{result.reason or 'none'}。未重发问题或答案；请核对后使用 /ask resume 已核验。"
+                        reply = f"清理结果：{result.status.value}；原因：{result.reason or 'none'}。未重发问题或答案；请核对后使用 /ask resume。"
                         if result.status in (
                             CleanupStatus.CLEANUP_FAILED,
                             CleanupStatus.CLEANUP_UNKNOWN,
@@ -426,14 +503,13 @@ class BrowserChatPlugin(Star):
                         await self.browser.resolve_cleanup(
                             task_id, event.get_sender_id()
                         )
-                        reply = "已记录人工核对，该条记录不再阻止恢复；原清理结果不变，本次未执行删除。请使用 /ask resume 已核验 重新检查。"
+                        reply = "已记录人工核对，该条记录不再阻止恢复；原清理结果不变，本次未执行删除。请使用 /ask resume 重新检查。"
                 except BrowserError as error:
                     descriptions = {
                         "busy": "旧任务、页面或管理操作仍在退出，请稍后重试。",
                         "not_registered": "没有这条归属记录，请填写完整任务ID。",
                         "review_required": "该任务可能已尝试删除，或已核销；禁止自动重试，请先核查。",
                         "already_cleaned": "该记录无需核销。",
-                        "settings_unverified": "请先人工核验账号设置并执行 /ask resume 已核验，再重试清理。",
                         "resource_pending": "核查页面仍未关闭，请等待资源释放。",
                         "login": "专用浏览器登录已失效，请手动登录并重新核验账号设置。",
                         "challenge": "请在专用浏览器手动处理验证后再恢复。",
@@ -460,26 +536,14 @@ class BrowserChatPlugin(Star):
                     await self._reply(event, "旧任务仍在退出或清理，请稍后恢复。")
                     return
                 await self.manager.pause("resuming")
-                reason = await self._start_browser()
-                if reason is None:
-                    try:
-                        status = await self.browser.resume(
-                            account_settings_verified=text.endswith(" 已核验")
-                        )
-                        reason = (
-                            None
-                            if status == BrowserStatus.READY
-                            else (self.browser.pause_reason or "browser")
-                        )
-                    except Exception as error:
-                        self.logger.warning(
-                            "Browser resume failed: type=%s", type(error).__name__
-                        )
-                        reason = (
-                            "cleanup" if self.browser.cleanup_problem else "browser"
-                        )
+                reason = await self._ensure_ready()
                 if reason is None and not self._closing:
                     await self.manager.resume()
+                    self._startup_fault = None
+                    if self._startup_binding_task:
+                        self._startup_binding_task.cancel()
+                    for task in tuple(self._startup_notice_tasks):
+                        task.cancel()
                     await self._reply(event, "网页就绪检查通过，已恢复接单。")
                 else:
                     await self.manager.pause(reason or "closed")
@@ -488,7 +552,7 @@ class BrowserChatPlugin(Star):
                     else:
                         await self._reply(
                             event,
-                            "仍暂停（{}）。请在专用浏览器手动登录，关闭记忆、引用聊天历史和自定义指令；实际核验后使用 /ask resume 已核验。依赖缺失时请用宿主解释器安装 requirements.txt。".format(
+                            "仍暂停（{}）。请在专用浏览器手动登录，关闭记忆、引用聊天历史和自定义指令；实际核验后使用 /ask resume。依赖缺失时请用宿主解释器安装 requirements.txt。".format(
                                 reason or "closed"
                             ),
                         )
@@ -744,6 +808,17 @@ class BrowserChatPlugin(Star):
     async def _terminate_owned(self):
         async with self._lifecycle:
             try:
+                self._startup_fault = None
+                if self._startup_binding_task:
+                    self._startup_binding_task.cancel()
+                    await asyncio.gather(
+                        self._startup_binding_task, return_exceptions=True
+                    )
+                for task in tuple(self._startup_notice_tasks):
+                    task.cancel()
+                await asyncio.gather(
+                    *tuple(self._startup_notice_tasks), return_exceptions=True
+                )
                 if self.manager:
                     await self.manager.close()
                 if self.browser:

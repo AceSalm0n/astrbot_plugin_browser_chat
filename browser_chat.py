@@ -206,7 +206,6 @@ class ChatGPTBrowser:
         self._check_key = object()
         self._closing = False
         self._resuming = False
-        self._settings_verified = False
         self._close_task = None
         self._asks = {}
         self._closing_requests = set()
@@ -351,7 +350,6 @@ class ChatGPTBrowser:
             await asyncio.gather(*tuple(self._window_jobs), return_exceptions=True)
             self._closing = False
             self._closing_requests.clear()
-            self._settings_verified = False
 
     def _window_warning(self):
         """Report optional UI degradation once without changing business status."""
@@ -686,8 +684,6 @@ class ChatGPTBrowser:
             "structure": "browser",
             "unsupported_region": "config",
         }.get(reason, reason)
-        if reason in ("login", "challenge"):
-            self._settings_verified = False
 
     async def _check_page(self, page, *, structure=False):
         """Inspect visible page health using candidate UI selectors only.
@@ -767,18 +763,12 @@ class ChatGPTBrowser:
                     raise
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
-    async def resume(self, *, account_settings_verified: bool = False) -> BrowserStatus:
+    async def resume(self) -> BrowserStatus:
         """Check residual ownership and visible login before opening admission.
-
-        Args:
-            account_settings_verified: Human confirmation that memory and custom
-                instructions were checked for this authenticated account.
 
         Returns:
             READY only after every ownership and readiness check succeeds.
         """
-        if type(account_settings_verified) is not bool:
-            raise ValueError("Account confirmation must be boolean")
         async with self._operations:
             if (
                 self._closing
@@ -804,15 +794,11 @@ class ChatGPTBrowser:
                         self._save_records()
                     except BrowserError:
                         return self.status
-                self._settings_verified |= account_settings_verified
                 if self.cleanup_issues():
                     self._pause("cleanup")
                     return self.status
                 if any(not task.done() for task in self._late_closers.values()):
                     self._pause("cleanup")
-                    return self.status
-                if not self._settings_verified:
-                    self._pause("config")
                     return self.status
                 # Reserve a portion of the single probe budget for page closure.
                 deadline = asyncio.get_running_loop().time() + CLEANUP_TIMEOUT_SECONDS
@@ -997,8 +983,6 @@ class ChatGPTBrowser:
                 or record["cleanup_resolution"] is not None
             ):
                 raise BrowserError("review_required")
-            if not self._settings_verified:
-                raise BrowserError("settings_unverified")
             if self.context is None:
                 raise BrowserError("browser")
             self._cleanups[task_id] = asyncio.create_task(self._cleanup_owned(task_id))
@@ -1410,11 +1394,6 @@ class ChatGPTBrowser:
             else:
                 status, reason = CleanupStatus.CLEANUP_UNKNOWN, "confirmation_timeout"
         except Exception as error:
-            if isinstance(error, BrowserError) and error.category in (
-                "login",
-                "challenge",
-            ):
-                self._settings_verified = False
             status = (
                 CleanupStatus.CLEANUP_UNKNOWN
                 if task_id in self._deleting
