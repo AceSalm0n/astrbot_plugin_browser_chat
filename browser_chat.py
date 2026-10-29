@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING
-from urllib.parse import unquote, urljoin, urlsplit
+from urllib.parse import unquote, urlsplit
 
 try:
     from .site_adapters import (
@@ -1236,11 +1236,25 @@ class ChatGPTBrowser:
                         links = body.locator("a:visible")
                         for link_index in range(await links.count()):
                             href = await links.nth(link_index).get_attribute("href")
-                            if href:
-                                href = urljoin(page.url, href)
+                            if not href:
+                                continue
+                            try:
+                                parsed = urlsplit(href)
+                                host = (parsed.hostname or "").rstrip(".").lower()
+                                site_host = (
+                                    (urlsplit(page.url).hostname or "")
+                                    .rstrip(".")
+                                    .lower()
+                                )
+                            except ValueError:
+                                continue
                             if (
-                                href
-                                and href.startswith(("https://", "http://"))
+                                parsed.scheme in ("http", "https")
+                                and host
+                                and parsed.username is None
+                                and parsed.password is None
+                                and host != site_host
+                                and not host.endswith("." + site_host)
                                 and href not in parts[-1]
                             ):
                                 parts.append(href)

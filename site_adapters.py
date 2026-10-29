@@ -3,7 +3,7 @@
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urlsplit
 
 COMPOSER = (
     ':is(#prompt-textarea[contenteditable="true"][role="textbox"], '
@@ -292,11 +292,21 @@ class DeepSeekSite:
             for index in range(await links.count()):
                 href = await links.nth(index).get_attribute("href")
                 if href:
-                    href = urljoin(page.url, href)
-                    parsed = urlsplit(href)
+                    try:
+                        parsed = urlsplit(href)
+                        host = (parsed.hostname or "").rstrip(".").lower()
+                        site_host = (
+                            (urlsplit(page.url).hostname or "").rstrip(".").lower()
+                        )
+                    except ValueError:
+                        continue
                     if (
                         parsed.scheme in ("http", "https")
-                        and parsed.netloc
+                        and host
+                        and parsed.username is None
+                        and parsed.password is None
+                        and host != site_host
+                        and not host.endswith("." + site_host)
                         and href not in text
                     ):
                         text += "\n" + href
