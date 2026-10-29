@@ -141,6 +141,7 @@ class TaskManager:
         capacity: Nonnegative waiting capacity; zero disables waiting.
         queue_timeout_s: Finite positive monotonic waiting budget.
         runner: Coroutine covering execution, delivery and bounded cleanup.
+        max_pending_per_user: Maximum running and queued tasks per identity.
 
     Raises:
         ValueError: Invalid constructor arguments.
@@ -305,6 +306,7 @@ class TaskManager:
 
         Args:
             user_key: Platform and sender id; shared across group/private chats.
+            task_id: Exact owned ID, or None only when one task is pending.
 
         Returns:
             Whether an unfinished task was found. Cancellation cannot retract

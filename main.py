@@ -54,7 +54,7 @@ from .scheduler import (
 )
 
 COMMAND_PATTERN = (
-    r"\A(?:/ask|ask) (?:ai(?=\s|\Z)[\s\S]*|status|pause|resume(?: 已核验)?|cancel|"
+    r"\A(?:/ask|ask) (?:ai(?=\s|\Z)[\s\S]*|status|pause|resume(?: 已核验)?|cancel(?: [A-Za-z0-9_-]{1,200})?|"
     r"cleanup (?:(?:check|retry) [A-Za-z0-9_-]{1,200}|resolve [A-Za-z0-9_-]{1,200} 已核对))\Z"
 )
 READINESS_TIMEOUT_SECONDS = 60
@@ -68,6 +68,7 @@ DEFAULT_CONFIG = {
     "user_allowlist_scope": "all",
     "max_concurrency": 1,
     "queue_capacity": 5,
+    "max_pending_per_user": 3,
     "execution_timeout_seconds": 180,
     "queue_timeout_seconds": 600,
     "max_reply_chars": 12000,
@@ -131,6 +132,7 @@ def validate_config(config: Mapping) -> dict:
     for key in (
         "max_concurrency",
         "queue_capacity",
+        "max_pending_per_user",
         "max_input_chars",
         "max_reply_chars",
         "forward_node_chars",
@@ -224,6 +226,7 @@ class BrowserChatPlugin(Star):
                 settings["queue_capacity"],
                 settings["queue_timeout_seconds"],
                 self._run,
+                max_pending_per_user=settings["max_pending_per_user"],
             )
             await self.manager.start()
             await self.manager.pause("config" if self.config_error else "starting")
@@ -599,14 +602,21 @@ class BrowserChatPlugin(Star):
                         )
             return
         if command == "cancel":
-            found = await self.manager.cancel(
-                (event.get_platform_id(), event.get_sender_id())
-            )
+            user_key = (event.get_platform_id(), event.get_sender_id())
+            parts = text.split()
+            task_id = parts[2] if len(parts) == 3 else None
+            pending = self.manager.pending(user_key)
+            if task_id is None and len(pending) > 1:
+                lines = ["你有多个未完成任务，请使用 /ask cancel <完整任务ID> 指定："]
+                lines.extend(f"{item_id}：{phase.value}" for item_id, phase in pending)
+                await self._reply(event, "\n".join(lines))
+                return
+            found = await self.manager.cancel(user_key, task_id)
             await self._reply(
                 event,
                 "取消处理已结束；已提交或结果未知的消息不会撤回。"
                 if found
-                else "没有你的未完成任务。",
+                else "没有找到你的指定未完成任务。",
             )
             return
         if not check_access(event.get_sender_id(), event.get_group_id(), settings):

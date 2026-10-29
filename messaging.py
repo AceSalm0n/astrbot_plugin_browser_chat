@@ -264,7 +264,7 @@ _REASONS = {
     "paused": "服务已暂停",
     "closed": "服务已关闭",
     "queue_full": "等待队列已满",
-    "user_busy": "你已有未完成任务",
+    "user_busy": "你的未完成任务已达到上限",
     "access_denied": "没有使用权限",
     "empty_prompt": "问题不能为空",
     "input_too_long": "问题超过长度限制",
