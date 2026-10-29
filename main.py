@@ -777,6 +777,9 @@ class BrowserChatPlugin(Star):
             outcome = await self.manager.wait(task_id)
             if outcome.result != JobResult.SUCCESS:
                 reason = outcome.reason or outcome.result.value
+                manual_pause = reason == "manual_pause"
+                if manual_pause:
+                    reason = "paused"
                 category = (
                     (self.manager.snapshot().pause_reason or "paused")
                     if reason == "paused"
@@ -789,7 +792,7 @@ class BrowserChatPlugin(Star):
                     template=settings["user_failure_template"],
                     timeout_s=SEND_TIMEOUT_SECONDS,
                 )
-                if outcome.result != JobResult.CANCELLED:
+                if outcome.result != JobResult.CANCELLED and not manual_pause:
                     await self._notifiers[route.platform_id].notify_failure(
                         route.platform_id, fault
                     )

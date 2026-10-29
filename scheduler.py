@@ -331,7 +331,10 @@ class TaskManager:
         self._state, self._pause_reason = ManagerState.PAUSED, reason
         for current in list(self._queued.values()):
             self._queued.pop(current.task_id)
-            current.result, current.reason = JobResult.FAILED, "paused"
+            current.result, current.reason = (
+                JobResult.FAILED,
+                "manual_pause" if reason == "manual" else "paused",
+            )
             self._finish(current)
         for current, task in self._active.values():
             self._request_cancel(current, task)
