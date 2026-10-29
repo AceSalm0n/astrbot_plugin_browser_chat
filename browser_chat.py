@@ -19,9 +19,9 @@ from typing import TYPE_CHECKING
 from urllib.parse import unquote, urljoin, urlsplit
 
 try:
-    from .site_adapters import COMPOSER, NEW_CHAT, ChatGPTSite
+    from .site_adapters import COMPOSER, NEW_CHAT, ChatGPTSite, site_data_root
 except ImportError:
-    from site_adapters import COMPOSER, NEW_CHAT, ChatGPTSite
+    from site_adapters import COMPOSER, NEW_CHAT, ChatGPTSite, site_data_root
 
 if TYPE_CHECKING:
     from playwright.async_api import BrowserContext, Playwright
@@ -150,7 +150,7 @@ class ChatGPTBrowser:
         profile_name = profile_name or (
             "browser_profile" if channel == "chrome" else "browser_profile_msedge"
         )
-        data_root = Path(data_dir).resolve()
+        data_root = site_data_root(data_dir, "chatgpt")
         profile_dir = data_root / profile_name
         registry_path = data_root / (
             "owned_sessions.json"

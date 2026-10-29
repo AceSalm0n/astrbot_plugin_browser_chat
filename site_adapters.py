@@ -1,5 +1,6 @@
 """Site-specific visible controls for browser chat."""
 
+from pathlib import Path
 from urllib.parse import urlsplit
 
 COMPOSER = (
@@ -8,6 +9,30 @@ COMPOSER = (
 )
 ACCOUNT = ':is([data-testid="accounts-profile-button"], button[aria-label="Open profile menu"]):visible'
 NEW_CHAT = ':is(a[aria-label="New chat"], button:has-text("New chat")):visible'
+
+
+def site_data_root(data_dir: Path, provider: str) -> Path:
+    """Resolve the site's isolated data root under the plugin data directory.
+
+    Args:
+        data_dir: Dedicated plugin data directory.
+        provider: Supported site identifier.
+
+    Returns:
+        The original root for ChatGPT or a separate DeepSeek root.
+
+    Raises:
+        ValueError: The site is unknown or its path escapes the data directory.
+    """
+    root = Path(data_dir).resolve()
+    if provider == "chatgpt":
+        return root
+    if provider != "deepseek":
+        raise ValueError("Unsupported site")
+    target = (root / "sites" / "deepseek").resolve()
+    if target == root or not target.is_relative_to(root):
+        raise ValueError("Site data path escapes plugin data directory")
+    return target
 
 
 class ChatGPTSite:
