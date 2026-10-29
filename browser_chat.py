@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import json
-import logging
 import math
 import os
 import re
@@ -17,6 +16,8 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import unquote, urlsplit
+
+from astrbot.api import logger
 
 try:
     from .site_adapters import (
@@ -388,9 +389,7 @@ class ChatGPTBrowser:
         """Report optional UI degradation once without changing business status."""
         if not self._window_warned:
             self._window_warned = True
-            logging.getLogger(__name__).warning(
-                "Optional browser window control unavailable"
-            )
+            logger.warning("Optional browser window control unavailable")
 
     def _window_done(self, task):
         """Release a tracked control job and observe any late exception."""

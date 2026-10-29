@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import math
 import re
 from collections.abc import Mapping
@@ -13,6 +12,8 @@ from enum import Enum
 from string import Formatter
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
+
+from astrbot.api import logger
 
 if TYPE_CHECKING:
     from .scheduler import SourceRoute
@@ -237,7 +238,7 @@ DEFAULT_ADMIN_TEMPLATE = (
     "[BrowserChat] {category}\n任务：{task_id}\n来源：{source}\n"
     "时间：{time}\n原因：{reason}\n次数：{count}"
 )
-_LOGGER = logging.getLogger(__name__)
+_LOGGER = logger
 _FIELDS = {"task_id", "reason", "category", "source", "time", "count"}
 _REASONS = {
     "dependency": "缺少浏览器依赖，请用宿主解释器安装 requirements.txt",
