@@ -1,4 +1,5 @@
 {
+  "website_provider": {"description": "网页问答站点", "hint": "chatgpt 或 deepseek；保存后重载插件生效。不同站点的浏览器资料和会话记录相互隔离", "type": "string", "options": ["chatgpt", "deepseek"], "default": "chatgpt"},
   "restrict_groups": {"description": "启用群白名单", "type": "bool", "default": false},
   "allowed_groups": {"description": "允许的群号", "hint": "字符串 ID；启用限制但列表为空时拒绝所有群", "type": "list", "default": []},
   "restrict_users": {"description": "启用用户白名单", "hint": "适用范围由用户白名单作用范围决定", "type": "bool", "default": false},

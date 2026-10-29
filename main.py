@@ -59,6 +59,7 @@ COMMAND_PATTERN = (
 )
 READINESS_TIMEOUT_SECONDS = 60
 DEFAULT_CONFIG = {
+    "website_provider": "chatgpt",
     "restrict_groups": False,
     "allowed_groups": [],
     "restrict_users": False,
@@ -100,6 +101,10 @@ def validate_config(config: Mapping) -> dict:
     if not isinstance(config, Mapping):
         raise ConfigError("config")
     result = {key: config.get(key, default) for key, default in DEFAULT_CONFIG.items()}
+    if not isinstance(result["website_provider"], str) or result[
+        "website_provider"
+    ] not in ("chatgpt", "deepseek"):
+        raise ConfigError("website_provider")
     for key in (
         "restrict_groups",
         "restrict_users",
@@ -163,7 +168,7 @@ def validate_config(config: Mapping) -> dict:
 
 
 class BrowserChatPlugin(Star):
-    """ChatGPT browser chat: /ask ai, status, resume and own-task cancel."""
+    """Browser chat commands, readiness, and task lifecycle."""
 
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context, config)
@@ -329,11 +334,17 @@ class BrowserChatPlugin(Star):
     async def _start_browser(self):
         try:
             if self.browser is None:
+                site_options = (
+                    {"provider": "deepseek", "base_url": "https://chat.deepseek.com/"}
+                    if self.settings["website_provider"] == "deepseek"
+                    else {}
+                )
                 self.browser = ChatGPTBrowser(
                     StarTools.get_data_dir("astrbot_plugin_browser_chat"),
                     channel=self.settings["browser_channel"],
                     profile_name=self.settings["browser_profile_name"],
                     start_minimized=self.settings["browser_start_minimized"],
+                    **site_options,
                 )
             await self.browser.start()
             await self.browser.open_home()
@@ -417,7 +428,8 @@ class BrowserChatPlugin(Star):
             reason = self.config_error or (state.pause_reason if state else "starting")
             await self._reply(
                 event,
-                "BrowserChat：{}；执行 {}；等待 {}；原因 {}。".format(
+                "BrowserChat（{}）：{}；执行 {}；等待 {}；原因 {}。".format(
+                    settings["website_provider"],
                     state.state.value if state else "starting",
                     state.running if state else 0,
                     state.queued if state else 0,
