@@ -336,6 +336,16 @@ class TaskManager:
         for current, task in self._active.values():
             self._request_cancel(current, task)
 
+    async def wait_until_idle(self) -> None:
+        """Wait for active jobs to finish their own cleanup after pausing."""
+        if self._state != ManagerState.PAUSED:
+            raise RuntimeError("Waiting for idle requires a paused manager")
+        tasks = tuple(task for _, task in self._active.values())
+        if tasks:
+            await asyncio.gather(
+                *(asyncio.shield(task) for task in tasks), return_exceptions=True
+            )
+
     async def resume(self) -> None:
         """Reopen admission after prior tasks exit; browser READY is caller-owned.
 

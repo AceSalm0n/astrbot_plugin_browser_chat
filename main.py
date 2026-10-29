@@ -54,7 +54,7 @@ from .scheduler import (
 )
 
 COMMAND_PATTERN = (
-    r"\A(?:/ask|ask) (?:ai(?=\s|\Z)[\s\S]*|status|resume(?: 已核验)?|cancel|"
+    r"\A(?:/ask|ask) (?:ai(?=\s|\Z)[\s\S]*|status|pause|resume(?: 已核验)?|cancel|"
     r"cleanup (?:(?:check|retry) [A-Za-z0-9_-]{1,200}|resolve [A-Za-z0-9_-]{1,200} 已核对))\Z"
 )
 DEFAULT_CONFIG = {
@@ -332,7 +332,7 @@ class BrowserChatPlugin(Star):
         admin = (
             event.is_admin() is True or event.get_sender_id() in settings["admin_ids"]
         )
-        if command in ("status", "resume", "cleanup") and not admin:
+        if command in ("status", "pause", "resume", "cleanup") and not admin:
             await self._reply(event, "没有管理权限。")
             return
         if command == "status":
@@ -351,6 +351,19 @@ class BrowserChatPlugin(Star):
             return
         if self._closing or not self._initialized or self.config_error:
             await self._reply(event, "服务未就绪，请管理员检查配置并重载本插件。")
+            return
+        if command == "pause":
+            async with self._lifecycle:
+                state = self.manager.snapshot()
+                await self.manager.pause(state.pause_reason or "manual")
+                await self.manager.wait_until_idle()
+                if self.browser and self.browser.cleanup_problem:
+                    await self.manager.pause("cleanup")
+                    await self._reply(event, self._cleanup_summary())
+                else:
+                    await self._reply(
+                        event, "服务已暂停，任务已退出；可以手动操作专用浏览器。"
+                    )
             return
         if command == "cleanup":
             async with self._lifecycle:
@@ -515,8 +528,10 @@ class BrowserChatPlugin(Star):
                         current = current[len(prefix) :].strip()
                         break
             prompt_event = SimpleNamespace(
-                get_messages=lambda: [SimpleNamespace(type="Plain", text=current)]
-                + [item for item in components if item.type == "Reply"],
+                get_messages=lambda: (
+                    [SimpleNamespace(type="Plain", text=current)]
+                    + [item for item in components if item.type == "Reply"]
+                ),
                 is_at_or_wake_command=event.is_at_or_wake_command,
             )
             prompt = extract_prompt(prompt_event, settings["max_input_chars"])
