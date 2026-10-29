@@ -18,6 +18,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import unquote, urljoin, urlsplit
 
+try:
+    from .site_adapters import COMPOSER, NEW_CHAT, ChatGPTSite
+except ImportError:
+    from site_adapters import COMPOSER, NEW_CHAT, ChatGPTSite
+
 if TYPE_CHECKING:
     from playwright.async_api import BrowserContext, Playwright
 
@@ -32,12 +37,6 @@ WINDOW_RESERVE_SECONDS = 1
 
 # Current semantic controls were observed on the authenticated site; retain
 # previous selectors for the local fixtures and older site layouts.
-COMPOSER = (
-    ':is(#prompt-textarea[contenteditable="true"][role="textbox"], '
-    '[contenteditable="true"][role="textbox"][data-composer-markdown]):visible'
-)
-ACCOUNT = ':is([data-testid="accounts-profile-button"], button[aria-label="Open profile menu"]):visible'
-NEW_CHAT = ':is(a[aria-label="New chat"], button:has-text("New chat")):visible'
 SEND = (
     ':is([data-testid="send-button"], button[type="submit"][aria-label="Send"]):visible'
 )
@@ -183,6 +182,7 @@ class ChatGPTBrowser:
             raise ValueError("Unsupported browser origin")
         self.base_url = base_url.rstrip("/") + "/"
         self._origin = f"{parsed.scheme}://{parsed.netloc}"
+        self._site = ChatGPTSite(self._origin, BrowserError)
         self.profile_dir = profile_dir
         self._registry_path = registry_path
         self.channel = channel
@@ -686,60 +686,8 @@ class ChatGPTBrowser:
         }.get(reason, reason)
 
     async def _check_page(self, page, *, structure=False):
-        """Inspect visible page health using candidate UI selectors only.
-
-        Args:
-            page: An owned page or the dedicated manual account page.
-            structure: Also require the new-chat input controls.
-
-        Raises:
-            BrowserError: Authentication, challenge, or visible UI is unavailable.
-        """
-        authentication_page = urlsplit(page.url).hostname == "auth.openai.com"
-        if not authentication_page and not page.url.startswith(self._origin + "/"):
-            raise BrowserError("browser")
-        account_visible = await page.locator(ACCOUNT).first.is_visible()
-        if authentication_page:
-            raise BrowserError("login")
-        if "just a moment" in (await page.title()).lower():
-            raise BrowserError("challenge")
-        if not account_visible:
-            candidates = page.get_by_text("Verify you are human", exact=False)
-            for index in range(await candidates.count()):
-                candidate = candidates.nth(index)
-                if (
-                    await candidate.is_visible()
-                    and not await candidate.locator(
-                        "xpath=ancestor-or-self::*[@data-message-author-role]"
-                    ).count()
-                ):
-                    raise BrowserError("challenge")
-        if await page.get_by_role(
-            "button", name="Log in", exact=True
-        ).first.is_visible():
-            raise BrowserError("login")
-        alerts = page.locator('[role="alert"]:visible')
-        for index in range(await alerts.count()):
-            alert = (await alerts.nth(index).inner_text()).lower()
-            if "too many requests" in alert or "rate limit" in alert:
-                raise BrowserError("rate_limit")
-            if "something went wrong" in alert:
-                raise BrowserError("browser")
-            if alert.strip() in (
-                "services not available in your country",
-                "unsupported country, region, or territory",
-                "you are connecting from an unsupported country, region, or territory.",
-            ):
-                raise BrowserError("unsupported_region")
-        if not account_visible:
-            # A missing candidate is not evidence of logout: hydration or an
-            # unknown layout must remain a structure failure.
-            raise BrowserError("structure")
-        if structure:
-            # The current site renders Send only after the input is nonempty.
-            for selector in (COMPOSER, NEW_CHAT):
-                if not await page.locator(selector).first.is_visible():
-                    raise BrowserError("structure")
+        """Delegate visible page checks to the selected site adapter."""
+        await self._site.check_page(page, structure=structure)
 
     async def _wait_page_ready(self, page):
         """Wait for visible controls within both local and caller deadlines.
