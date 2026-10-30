@@ -9,6 +9,8 @@ import math
 import os
 import re
 import tempfile
+import time
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -47,6 +49,8 @@ POLL_INTERVAL_SECONDS = 0.1
 PAGE_READY_TIMEOUT_SECONDS = 12
 WINDOW_CONTROL_SECONDS = 0.2
 WINDOW_RESERVE_SECONDS = 1
+CLEANUP_RESULT_LIMIT = 2048
+CLEANUP_RESULT_TTL_SECONDS = 300
 
 # Current semantic controls were observed on the authenticated site; retain
 # previous selectors for the local fixtures and older site layouts.
@@ -246,6 +250,7 @@ class ChatGPTBrowser:
         self._pages = {}
         self._opening = {}
         self._cleanups = {}
+        self._cleanup_results = OrderedDict()
         self._late_closers = {}
         self._deleting = set()
         self._probe_key = object()
@@ -254,7 +259,6 @@ class ChatGPTBrowser:
         self._records_dirty = False
         self._migration_source = None
         self._load_records()
-        self._recovery = set(self._records)
 
     async def start(self) -> None:
         """Open the owned browser, keeping admission paused until site checks.
@@ -356,9 +360,7 @@ class ChatGPTBrowser:
                     if task_id is self._probe_key:
                         continue
                     if task_id not in self._cleanups:
-                        self._cleanups[task_id] = asyncio.create_task(
-                            self._cleanup_owned(task_id)
-                        )
+                        self._start_cleanup(task_id)
                 await asyncio.gather(*self._cleanups.values(), return_exceptions=True)
                 pending = [
                     item for item in self._late_closers.values() if not item.done()
@@ -378,6 +380,8 @@ class ChatGPTBrowser:
                 self._opening.clear()
                 self._pages.clear()
                 self._late_closers.clear()
+                self._cleanups.clear()
+                self._cleanup_results.clear()
         finally:
             for job in tuple(self._window_jobs):
                 job.cancel()
@@ -942,7 +946,6 @@ class ChatGPTBrowser:
             except BrowserError:
                 record["cleanup_resolution"] = None
                 raise
-            self._recovery.discard(task_id)
 
     async def retry_cleanup(self, task_id: str) -> CleanupResult:
         """Retry only a known task whose final delete was never attempted.
@@ -964,8 +967,9 @@ class ChatGPTBrowser:
                 raise BrowserError("review_required")
             if self.context is None:
                 raise BrowserError("browser")
-            self._cleanups[task_id] = asyncio.create_task(self._cleanup_owned(task_id))
-            return await asyncio.shield(self._cleanups[task_id])
+            self._cleanup_results.pop(task_id, None)
+            task = self._start_cleanup(task_id)
+            return await asyncio.shield(task)
 
     async def check_cleanup(self, task_id: str) -> CleanupCheckResult:
         """Inspect one exact owned URL without deletion, submission, or writes.
@@ -1102,7 +1106,6 @@ class ChatGPTBrowser:
                 "cleanup_resolution": None,
             }
             self._records[task_id] = record
-            self._recovery.add(task_id)
             self._save_records()
             self._asks[task_id] = asyncio.current_task()
         try:
@@ -1400,6 +1403,9 @@ class ChatGPTBrowser:
                 return CleanupResult(
                     CleanupStatus.NOT_CREATED, task_id, reason="not_registered"
                 )
+            cached = self._cached_cleanup_result(task_id)
+            if cached is not None:
+                return cached
             if (
                 self._closing
                 and task_id not in self._cleanups
@@ -1408,15 +1414,62 @@ class ChatGPTBrowser:
                 # A cancelled ask's own finally must finish before close can
                 # finish waiting for that caller; unrelated late work waits.
                 closing = self._close_task
-            elif task_id not in self._cleanups:
-                self._cleanups[task_id] = asyncio.create_task(
-                    self._cleanup_owned(task_id)
-                )
-            task = self._cleanups.get(task_id)
+            else:
+                task = self._cleanups.get(task_id)
+                if task is None or task.done():
+                    task = self._start_cleanup(task_id)
         if closing is not None:
             await asyncio.shield(closing)
             return await self.cleanup(task_id, keep=keep)
         return await asyncio.shield(task)
+
+    def _cached_cleanup_result(self, task_id):
+        """Return one unexpired result and discard stale cache entries."""
+        now = time.monotonic()
+        for key, (created, _) in tuple(self._cleanup_results.items()):
+            if now - created >= CLEANUP_RESULT_TTL_SECONDS:
+                self._cleanup_results.pop(key, None)
+        entry = self._cleanup_results.get(task_id)
+        if entry is None:
+            return None
+        self._cleanup_results.move_to_end(task_id)
+        return entry[1]
+
+    def _start_cleanup(self, task_id):
+        """Create and register the shared cleanup task for one owner."""
+        task = asyncio.create_task(self._cleanup_owned(task_id))
+        self._cleanups[task_id] = task
+        task.add_done_callback(
+            lambda completed, owner=task_id: self._cleanup_done(owner, completed)
+        )
+        return task
+
+    def _cleanup_done(self, task_id, task):
+        """Forget one finished cleanup and cache only its immutable result."""
+        if self._cleanups.get(task_id) is not task:
+            if not task.cancelled():
+                task.exception()
+            return
+        self._cleanups.pop(task_id, None)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            return
+        result = task.result()
+        if not isinstance(result, CleanupResult):
+            return
+        self._cleanup_results[task_id] = (time.monotonic(), result)
+        self._cleanup_results.move_to_end(task_id)
+        while len(self._cleanup_results) > CLEANUP_RESULT_LIMIT:
+            self._cleanup_results.popitem(last=False)
+
+    def _late_closer_done(self, task_id, task):
+        """Forget this exact completed closer while observing its exception."""
+        if self._late_closers.get(task_id) is task:
+            self._late_closers.pop(task_id, None)
+        if not task.cancelled():
+            task.exception()
 
     async def _cleanup_owned(self, task_id):
         """Bound deletion and close this task's own page even on failure.
@@ -1476,12 +1529,6 @@ class ChatGPTBrowser:
                 self._save_records()
             except BrowserError:
                 status, reason = CleanupStatus.CLEANUP_UNKNOWN, "record_write"
-        if status in (
-            CleanupStatus.NOT_CREATED,
-            CleanupStatus.RETAINED,
-            CleanupStatus.DELETED,
-        ):
-            self._recovery.discard(task_id)
         result = CleanupResult(
             status, task_id, record["conversation_id"] if record else None, reason
         )
@@ -1504,6 +1551,11 @@ class ChatGPTBrowser:
         if closer is None or closer.done():
             closer = asyncio.create_task(self._close_task_page(task_id))
             self._late_closers[task_id] = closer
+            closer.add_done_callback(
+                lambda completed, owner=task_id: self._late_closer_done(
+                    owner, completed
+                )
+            )
         remaining = deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
             return None
