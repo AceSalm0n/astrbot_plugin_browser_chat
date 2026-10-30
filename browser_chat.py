@@ -241,6 +241,8 @@ class ChatGPTBrowser:
         self._cleanup_lock = asyncio.Lock()
         self._maintenance_task = None
         self._home_page = None
+        self._home_navigated_at = None
+        self._bootstrap_pages = []
         self._home_key = object()
         self._check_key = object()
         self._closing = False
@@ -309,6 +311,13 @@ class ChatGPTBrowser:
                     ),
                     START_TIMEOUT_SECONDS,
                 )
+                self._bootstrap_pages = []
+                for page in self.context.pages:
+                    try:
+                        if not page.is_closed() and page.url == "about:blank":
+                            self._bootstrap_pages.append(page)
+                    except Exception:
+                        continue
                 if self.start_minimized and os.name == "nt" and self.context.pages:
                     self._window_generation += 1
                     await self._window_call(
@@ -783,23 +792,38 @@ class ChatGPTBrowser:
                 raise BrowserError("closed")
             if self._home_page is not None and not self._home_page.is_closed():
                 return
+            self._home_page = None
+            self._home_navigated_at = None
             if self._home_key in self._opening or self._home_key in self._pages:
                 raise BrowserError("busy")
             deadline = asyncio.get_running_loop().time() + START_TIMEOUT_SECONDS
             page = None
             try:
-                page = await asyncio.wait_for(
-                    self._open_owned_page(
-                        self._home_key, deadline - START_TIMEOUT_SECONDS * 0.2
-                    ),
-                    START_TIMEOUT_SECONDS * 0.8,
-                )
+                candidates, self._bootstrap_pages = self._bootstrap_pages, []
+                for candidate in candidates:
+                    try:
+                        if not candidate.is_closed() and candidate.url == "about:blank":
+                            page = candidate
+                            break
+                    except Exception:
+                        continue
+                if page is not None:
+                    # Ownership is recorded synchronously before any navigation await.
+                    self._pages[self._home_key] = page
+                else:
+                    page = await asyncio.wait_for(
+                        self._open_owned_page(
+                            self._home_key, deadline - START_TIMEOUT_SECONDS * 0.2
+                        ),
+                        START_TIMEOUT_SECONDS * 0.8,
+                    )
                 remaining = deadline - asyncio.get_running_loop().time()
                 await asyncio.wait_for(
                     page.goto(self.base_url, wait_until="domcontentloaded"),
                     max(0, remaining * 0.9),
                 )
                 self._home_page = page
+                self._home_navigated_at = asyncio.get_running_loop().time()
                 self._opening.pop(self._home_key, None)
                 self._pages.pop(self._home_key, None)
             finally:
@@ -981,14 +1005,26 @@ class ChatGPTBrowser:
         return CleanupCheckResult(task_id, "available" if visible else "unknown")
 
     async def _probe_ready(self):
-        """Inspect a disposable owned page inside resume's total probe budget.
+        """Check a recently navigated home or inspect a disposable owned page.
 
         Raises:
             BrowserError: The visible login or required controls are unavailable.
         """
+        loop = asyncio.get_running_loop()
+        home = self._home_page
+        navigated_at = self._home_navigated_at
+        if (
+            home is not None
+            and not home.is_closed()
+            and home.url == self.base_url
+            and navigated_at is not None
+            and 0 <= loop.time() - navigated_at <= PAGE_READY_TIMEOUT_SECONDS
+        ):
+            await self._wait_page_ready(home)
+            return
         probe = await self._open_owned_page(
             self._probe_key,
-            asyncio.get_running_loop().time() + CLEANUP_TIMEOUT_SECONDS * 0.9,
+            loop.time() + CLEANUP_TIMEOUT_SECONDS * 0.9,
         )
         await probe.goto(self.base_url, wait_until="domcontentloaded")
         await self._wait_page_ready(probe)
@@ -1737,6 +1773,8 @@ class ChatGPTBrowser:
         """
         self._abandon_start = True
         self._home_page = None
+        self._home_navigated_at = None
+        self._bootstrap_pages = []
         try:
             try:
                 if self.context is not None:
