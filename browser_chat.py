@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
-import json
 import math
 import os
 import re
-import tempfile
 import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -22,6 +21,7 @@ from urllib.parse import unquote, urlsplit
 from astrbot.api import logger
 
 try:
+    from .session_store import SessionStore, StoreError
     from .site_adapters import (
         COMPOSER,
         NEW_CHAT,
@@ -30,6 +30,7 @@ try:
         site_data_root,
     )
 except ImportError:
+    from session_store import SessionStore, StoreError
     from site_adapters import (
         COMPOSER,
         NEW_CHAT,
@@ -258,6 +259,13 @@ class ChatGPTBrowser:
         self._registry_valid = True
         self._records_dirty = False
         self._migration_source = None
+        self._store = SessionStore(
+            data_root, registry_path, self._site.conversation_url
+        )
+        self._record_write_lock = asyncio.Lock()
+        self._save_waiters = set()
+        self._pending_saves = 0
+        self._writer = None
         self._load_records()
 
     async def start(self) -> None:
@@ -368,6 +376,7 @@ class ChatGPTBrowser:
                 if pending:
                     # Context shutdown below terminates any still-pending opener.
                     await asyncio.wait(pending, timeout=CLOSE_TIMEOUT_SECONDS / 2)
+                await asyncio.gather(*tuple(self._save_waiters), return_exceptions=True)
                 await self._release()
                 for item in (*self._opening.values(), *self._late_closers.values()):
                     if not item.done():
@@ -549,169 +558,94 @@ class ChatGPTBrowser:
                 self._window_lock.release()
 
     def _load_records(self):
-        """Reject untrusted ownership files without overwriting their bytes.
-
-        Returns:
-            None. Invalid files leave the instance paused for cleanup.
-        """
-        if not self._registry_path.exists():
-            return
+        """Load only active ownership metadata; invalid bytes remain untouched."""
         try:
-            original = self._registry_path.read_bytes()
-            payload = json.loads(original.decode("utf-8"))
-            if (
-                not isinstance(payload, dict)
-                or set(payload) != {"version", "sessions"}
-                or type(payload["version"]) is not int
-                or payload["version"] not in (1, 2)
-                or not isinstance(payload["sessions"], dict)
-            ):
-                raise ValueError
-            fields = {
-                "task_id",
-                "created_at",
-                "conversation_id",
-                "url",
-                "keep",
-                "answer_result",
-                "cleanup",
-                "submission",
-            }
-            extra = {
-                "cleanup_phase",
-                "cleanup_reason",
-                "cleanup_updated_at",
-                "cleanup_resolution",
-            }
-            for task_id, record in payload["sessions"].items():
-                if (
-                    not isinstance(task_id, str)
-                    or not task_id
-                    or len(task_id) > 200
-                    or not isinstance(record, dict)
-                    or set(record)
-                    != (fields if payload["version"] == 1 else fields | extra)
-                    or record["task_id"] != task_id
-                    or type(record["keep"]) is not bool
-                    or record["submission"]
-                    not in ("not_attempted", "attempted", "confirmed")
-                    or record["answer_result"]
-                    not in ("pending", "success", "failed", "cancelled", "timed_out")
-                    or record["cleanup"]
-                    not in ("pending", *(status.value for status in CleanupStatus))
-                    or datetime.fromisoformat(record["created_at"]).tzinfo is None
-                ):
-                    raise ValueError
-                conversation_id = record["conversation_id"]
-                if conversation_id is None:
-                    if record["url"] is not None:
-                        raise ValueError
-                elif (
-                    not isinstance(conversation_id, str)
-                    or record["submission"] != "confirmed"
-                    or record["url"] != self._site.conversation_url(conversation_id)
-                ):
-                    raise ValueError
-                if payload["version"] == 1:
-                    record.update(
-                        cleanup_phase=(
-                            "not_required"
-                            if record["keep"]
-                            or record["cleanup"] in ("retained", "not_created")
-                            else "confirmed"
-                            if record["cleanup"] == "deleted"
-                            else "legacy_unknown"
-                        ),
-                        cleanup_reason="legacy_record",
-                        cleanup_updated_at=record["created_at"],
-                        cleanup_resolution=None,
-                    )
-                if (
-                    record["cleanup_phase"]
-                    not in (
-                        "not_required",
-                        "not_started",
-                        "delete_requested",
-                        "confirmed",
-                        "legacy_unknown",
-                    )
-                    or not isinstance(record["cleanup_reason"], str)
-                    or re.fullmatch(r"[a-z_]{0,80}", record["cleanup_reason"]) is None
-                    or datetime.fromisoformat(record["cleanup_updated_at"]).tzinfo
-                    is None
-                    or (
-                        record["cleanup_phase"] == "not_required"
-                        and not record["keep"]
-                        and record["cleanup"] != "not_created"
-                    )
-                    or (
-                        record["cleanup"] == "deleted"
-                        and record["cleanup_phase"] != "confirmed"
-                    )
-                ):
-                    raise ValueError
-                resolution = record["cleanup_resolution"]
-                if resolution is not None and (
-                    not isinstance(resolution, dict)
-                    or set(resolution) != {"actor_id", "resolved_at", "action"}
-                    or resolution["action"] != "acknowledged"
-                    or not isinstance(resolution["actor_id"], str)
-                    or re.fullmatch(r"[0-9]{1,20}", resolution["actor_id"]) is None
-                    or not any(c != "0" for c in resolution["actor_id"])
-                    or datetime.fromisoformat(resolution["resolved_at"]).tzinfo is None
-                ):
-                    raise ValueError
-            self._records = payload["sessions"]
-            if payload["version"] == 1:
-                self._migration_source = original
-        except (OSError, ValueError, TypeError, KeyError, BrowserError):
+            self._records, self._migration_source = self._store.load()
+        except StoreError:
             self._registry_valid = False
             self._pause("cleanup")
 
-    def _save_records(self):
-        """Atomically persist ownership metadata, never question or answer text.
+    def _protected_records(self):
+        """Snapshot resource owners that cannot be moved out of hot metadata."""
+        if self._maintenance_task is not None:
+            return set(self._records)
+        return (
+            set(self._asks)
+            | set(self._pages)
+            | set(self._opening)
+            | {key for key, job in self._cleanups.items() if not job.done()}
+            | {key for key, job in self._late_closers.items() if not job.done()}
+            | self._deleting
+        )
 
-        Raises:
-            BrowserError: Ownership cannot be durably recorded.
+    async def _save_records(self):
+        """Serialize detached off-loop commits, joining physical writes on cancel.
+
+        Cancellation cannot abandon a durable intent or release its resource owner
+        before the physical writer has finished. Waiting callers snapshot only
+        after taking the writer lock, so an older snapshot cannot overwrite a
+        later one. Failed or still-requested saves remain diagnostically dirty.
         """
         if not self._registry_valid:
             raise BrowserError("cleanup")
+        completion = asyncio.get_running_loop().create_future()
+        self._save_waiters.add(completion)
+        self._pending_saves += 1
         self._records_dirty = True
-        temporary = None
         try:
-            self._registry_path.parent.mkdir(parents=True, exist_ok=True)
-            if self._migration_source is not None:
-                with tempfile.NamedTemporaryFile(
-                    mode="wb",
-                    dir=self._registry_path.parent,
-                    prefix=self._registry_path.name + ".v1-backup-",
-                    suffix=".json",
-                    delete=False,
-                ) as backup:
-                    backup.write(self._migration_source)
-                    backup.flush()
-                    os.fsync(backup.fileno())
+            async with self._record_write_lock:
+                snapshot = deepcopy(self._records)
+                protected = self._protected_records()
+                self._writer = asyncio.create_task(
+                    asyncio.to_thread(
+                        self._store.commit, snapshot, protected, self._migration_source
+                    )
+                )
+                cancelled = False
+                try:
+                    while not self._writer.done():
+                        try:
+                            await asyncio.shield(self._writer)
+                        except asyncio.CancelledError:
+                            cancelled = True
+                    archived = self._writer.result()
+                except StoreError:
+                    self._pause("cleanup")
+                    if cancelled:
+                        raise asyncio.CancelledError from None
+                    raise BrowserError("cleanup") from None
+                finally:
+                    self._writer = None
                 self._migration_source = None
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                encoding="utf-8",
-                dir=self._registry_path.parent,
-                prefix=".owned_sessions-",
-                suffix=".tmp",
-                delete=False,
-            ) as handle:
-                temporary = Path(handle.name)
-                json.dump({"version": 2, "sessions": self._records}, handle)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, self._registry_path)
-            self._records_dirty = False
-        except OSError:
+                protected = self._protected_records()
+                for key, record in archived.items():
+                    if key not in protected and self._records.get(key) == record:
+                        self._records.pop(key)
+                        self._cleanup_results.pop(key, None)
+                committed = {
+                    key: record
+                    for key, record in snapshot.items()
+                    if key not in archived
+                }
+                self._records_dirty = (
+                    self._pending_saves > 1 or self._records != committed
+                )
+                if cancelled:
+                    raise asyncio.CancelledError
+        finally:
+            self._pending_saves -= 1
+            self._save_waiters.discard(completion)
+            completion.set_result(None)
+
+    async def _archived_record(self, task_id):
+        """Lazily read one terminal archive; corruption is never an unknown ID."""
+        if not self._registry_valid:
+            raise BrowserError("cleanup")
+        try:
+            return await asyncio.to_thread(self._store.lookup, task_id)
+        except StoreError:
             self._pause("cleanup")
             raise BrowserError("cleanup") from None
-        finally:
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
 
     def _pause(self, reason):
         self.status = BrowserStatus.PAUSED
@@ -758,6 +692,7 @@ class ChatGPTBrowser:
                 or self._resuming
                 or self._maintenance_task is not None
                 or self._asks
+                or self._pending_saves
                 or self._pages
                 or self._opening
                 or any(not item.done() for item in self._cleanups.values())
@@ -774,7 +709,7 @@ class ChatGPTBrowser:
                     return self.status
                 if self._records_dirty:
                     try:
-                        self._save_records()
+                        await self._save_records()
                     except BrowserError:
                         return self.status
                 if self.cleanup_issues():
@@ -885,13 +820,14 @@ class ChatGPTBrowser:
         async with self._operations:
             if not self._registry_valid or self._records_dirty:
                 raise BrowserError("cleanup")
-            if not isinstance(task_id, str) or task_id not in self._records:
+            if not isinstance(task_id, str):
                 raise BrowserError("not_registered")
             if (
                 self._closing
                 or self._resuming
                 or self._maintenance_task is not None
                 or self._asks
+                or self._pending_saves
                 or self._pages
                 or self._opening
                 or any(not task.done() for task in self._cleanups.values())
@@ -902,7 +838,12 @@ class ChatGPTBrowser:
             self._maintenance_task = asyncio.current_task()
             self._pause("cleanup")
         try:
-            yield self._records[task_id]
+            record = self._records.get(task_id)
+            if record is None:
+                record = await self._archived_record(task_id)
+                if record is None:
+                    raise BrowserError("not_registered")
+            yield record
         except BrowserError as error:
             if error.category in (
                 "login",
@@ -932,6 +873,8 @@ class ChatGPTBrowser:
         ):
             raise BrowserError("invalid_actor")
         async with self._maintenance(task_id) as record:
+            if task_id not in self._records:
+                raise BrowserError("already_cleaned")
             if record["cleanup_resolution"] is not None:
                 return
             if not any(issue.task_id == task_id for issue in self.cleanup_issues()):
@@ -942,7 +885,7 @@ class ChatGPTBrowser:
                 "action": "acknowledged",
             }
             try:
-                self._save_records()
+                await self._save_records()
             except BrowserError:
                 record["cleanup_resolution"] = None
                 raise
@@ -960,6 +903,8 @@ class ChatGPTBrowser:
             BrowserError: Review is required, the browser is busy, or unavailable.
         """
         async with self._maintenance(task_id) as record:
+            if task_id not in self._records:
+                raise BrowserError("already_cleaned")
             if (
                 record["cleanup_phase"] != "not_started"
                 or record["cleanup_resolution"] is not None
@@ -984,6 +929,8 @@ class ChatGPTBrowser:
             BrowserError: The account or browser cannot be safely inspected.
         """
         async with self._maintenance(task_id):
+            if task_id not in self._records:
+                return CleanupCheckResult(task_id, "archived")
             deadline = asyncio.get_running_loop().time() + CLEANUP_TIMEOUT_SECONDS
             try:
                 return await asyncio.wait_for(
@@ -1089,8 +1036,18 @@ class ChatGPTBrowser:
                 or not self._registry_valid
             ):
                 raise BrowserError("not_ready")
-            if task_id in self._records:
+            if (
+                task_id in self._records
+                or await self._archived_record(task_id) is not None
+            ):
                 raise BrowserError("duplicate_task")
+            # Archive I/O yields while close may run independently of admission.
+            if (
+                self._closing
+                or self.context is None
+                or self.status != BrowserStatus.READY
+            ):
+                raise BrowserError("not_ready")
             record = {
                 "task_id": task_id,
                 "created_at": datetime.now(timezone.utc).isoformat(),
@@ -1106,20 +1063,20 @@ class ChatGPTBrowser:
                 "cleanup_resolution": None,
             }
             self._records[task_id] = record
-            self._save_records()
             self._asks[task_id] = asyncio.current_task()
         try:
+            await self._save_records()
             remaining = deadline - asyncio.get_running_loop().time()
             answer = await asyncio.wait_for(
                 self._ask_page(task_id, prompt, deadline), remaining
             )
             record["answer_result"] = "success"
-            self._save_records()
+            await self._save_records()
             return answer
         except asyncio.CancelledError:
             record["answer_result"] = "cancelled"
             try:
-                self._save_records()
+                await self._save_records()
             except BrowserError:
                 pass
             raise
@@ -1142,7 +1099,7 @@ class ChatGPTBrowser:
             elif self.pause_reason not in ("cleanup", "login", "challenge"):
                 self._pause("browser")
             try:
-                self._save_records()
+                await self._save_records()
             except BrowserError:
                 category = (
                     "cleanup"
@@ -1187,7 +1144,7 @@ class ChatGPTBrowser:
         assistants = await page.locator(ASSISTANT).count()
         await page.locator(COMPOSER).fill(prompt)
         record["submission"] = "attempted"
-        self._save_records()
+        await self._save_records()
         await page.locator(SEND).click()
         stable_text = None
         stable_since = None
@@ -1213,11 +1170,13 @@ class ChatGPTBrowser:
                 ):
                     raise BrowserError("submission_unknown", submission_unknown=True)
                 record["submission"] = "confirmed"
-                self._save_records()
+                await self._save_records()
             conversation_pending = False
             if record["submission"] == "confirmed":
                 # URL changes alone cannot establish that this task owns a chat.
-                conversation_pending = self._capture_conversation(record, page.url)
+                conversation_pending = await self._capture_conversation(
+                    record, page.url
+                )
             await self._check_page(page)
             if (
                 record["submission"] == "confirmed"
@@ -1302,7 +1261,7 @@ class ChatGPTBrowser:
         if users or answers:
             raise BrowserError("structure")
         record["submission"] = "attempted"
-        self._save_records()
+        await self._save_records()
         await self._site.submit_prompt(page)
         stable_text, stable_since = None, None
         while True:
@@ -1310,8 +1269,8 @@ class ChatGPTBrowser:
             if snapshot.submission_confirmed:
                 if record["submission"] != "confirmed":
                     record["submission"] = "confirmed"
-                    self._save_records()
-                self._capture_conversation(record, page.url)
+                    await self._save_records()
+                await self._capture_conversation(record, page.url)
             # Default cleanup needs a canonical owned URL; some sites assign it
             # after the final text is already visible.
             if snapshot.complete and (record["conversation_id"] or record["keep"]):
@@ -1324,7 +1283,7 @@ class ChatGPTBrowser:
                 stable_text, stable_since = None, None
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
-    def _capture_conversation(self, record, url):
+    async def _capture_conversation(self, record, url):
         """Capture a canonical URL only after the caller confirms its own prompt.
 
         Args:
@@ -1345,7 +1304,7 @@ class ChatGPTBrowser:
                 raise BrowserError("structure")
             if record["conversation_id"] is None:
                 record["conversation_id"], record["url"] = conversation_id, url
-                self._save_records()
+                await self._save_records()
             return False
         parsed = urlsplit(url)
         if parsed.hostname == "auth.openai.com":
@@ -1371,7 +1330,7 @@ class ChatGPTBrowser:
             raise BrowserError("structure")
         if record["conversation_id"] is None:
             record["conversation_id"], record["url"] = conversation_id, url
-            self._save_records()
+            await self._save_records()
         return False
 
     async def cleanup(self, task_id: str, keep: bool | None = None) -> CleanupResult:
@@ -1399,6 +1358,14 @@ class ChatGPTBrowser:
                         CleanupStatus.CLEANUP_UNKNOWN,
                         task_id,
                         reason="invalid_registry",
+                    )
+                archived = await self._archived_record(task_id)
+                if archived is not None:
+                    return CleanupResult(
+                        CleanupStatus(archived["cleanup"]),
+                        task_id,
+                        archived["conversation_id"],
+                        archived["cleanup_reason"],
                     )
                 return CleanupResult(
                     CleanupStatus.NOT_CREATED, task_id, reason="not_registered"
@@ -1481,6 +1448,31 @@ class ChatGPTBrowser:
             A safe cleanup status, including uncertain deletion outcomes.
         """
         record = self._records.get(task_id)
+        if (
+            record is not None
+            and record["cleanup"] in ("deleted", "not_created", "retained")
+            and task_id not in self._pages
+            and task_id not in self._opening
+            and task_id not in self._late_closers
+        ):
+            # Equal archive/active duplicates after an interrupted commit must
+            # retain their authoritative terminal bytes on idempotent cleanup.
+            if self._records_dirty:
+                try:
+                    await self._save_records()
+                except BrowserError:
+                    return CleanupResult(
+                        CleanupStatus.CLEANUP_UNKNOWN,
+                        task_id,
+                        record["conversation_id"],
+                        "record_write",
+                    )
+            return CleanupResult(
+                CleanupStatus(record["cleanup"]),
+                task_id,
+                record["conversation_id"],
+                record["cleanup_reason"],
+            )
         status = CleanupStatus.NOT_CREATED
         reason = "not_registered"
         deadline = asyncio.get_running_loop().time() + CLEANUP_TIMEOUT_SECONDS
@@ -1526,7 +1518,7 @@ class ChatGPTBrowser:
             if status in (CleanupStatus.RETAINED, CleanupStatus.NOT_CREATED):
                 record["cleanup_phase"] = "not_required"
             try:
-                self._save_records()
+                await self._save_records()
             except BrowserError:
                 status, reason = CleanupStatus.CLEANUP_UNKNOWN, "record_write"
         result = CleanupResult(
@@ -1638,7 +1630,7 @@ class ChatGPTBrowser:
             record["cleanup_phase"] = "delete_requested"
             record["cleanup_updated_at"] = datetime.now(timezone.utc).isoformat()
             try:
-                self._save_records()
+                await self._save_records()
             except BrowserError:
                 record["cleanup_phase"] = "not_started"
                 raise
@@ -1677,7 +1669,7 @@ class ChatGPTBrowser:
         record["cleanup_phase"] = "delete_requested"
         record["cleanup_updated_at"] = datetime.now(timezone.utc).isoformat()
         try:
-            self._save_records()
+            await self._save_records()
         except BrowserError:
             record["cleanup_phase"] = "not_started"
             raise

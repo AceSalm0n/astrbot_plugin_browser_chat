@@ -504,6 +504,7 @@ class BrowserChatPlugin(Star):
                             "available": "会话当前可访问",
                             "unavailable": "会话地址当前不可用，不代表已删除",
                             "unknown": "无法确认会话状态",
+                            "archived": "该任务已完成清理并归档，无需打开网页",
                         }
                         reply = (
                             descriptions[result.state]
