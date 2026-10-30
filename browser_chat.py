@@ -238,6 +238,7 @@ class ChatGPTBrowser:
         self._driver: Playwright | None = None
         self._startup_task: asyncio.Task[Playwright | None] | None = None
         self._abandon_start = False
+        self._release_failed = False
         self._lock = asyncio.Lock()
         self._operations = asyncio.Lock()
         self._cleanup_lock = asyncio.Lock()
@@ -283,6 +284,8 @@ class ChatGPTBrowser:
         async with self._lock:
             if self._closing:
                 raise BrowserError("closed")
+            if self._release_failed:
+                raise BrowserError("cleanup")
             if self.context is not None:
                 return
             if self._startup_task is not None:
@@ -391,6 +394,7 @@ class ChatGPTBrowser:
                     await asyncio.wait(pending, timeout=CLOSE_TIMEOUT_SECONDS / 2)
                 await asyncio.gather(*tuple(self._save_waiters), return_exceptions=True)
                 await self._release()
+                self._release_failed = False
                 for item in (*self._opening.values(), *self._late_closers.values()):
                     if not item.done():
                         item.cancel()
@@ -782,6 +786,9 @@ class ChatGPTBrowser:
             self._resuming = True
         try:
             async with self._lock:
+                if self._release_failed:
+                    self._pause("cleanup")
+                    return self.status
                 if self.context is None:
                     self._pause("browser")
                     return self.status
@@ -843,6 +850,8 @@ class ChatGPTBrowser:
     @property
     def cleanup_problem(self) -> str:
         """Expose a fixed diagnostic code, never a registry path or UI text."""
+        if self._release_failed:
+            return "release_failed"
         if not self._registry_valid:
             return "registry_invalid"
         if self._records_dirty:
@@ -1844,7 +1853,11 @@ class ChatGPTBrowser:
         # Playwright cannot stop a pipe transport before connect has finished.
         driver = await manager.__aenter__()
         if self._abandon_start:
-            await driver.stop()
+            try:
+                await asyncio.wait_for(driver.stop(), CLOSE_TIMEOUT_SECONDS / 2)
+            except BaseException:
+                self._driver = driver
+                raise
             return None
         return driver
 
@@ -1855,29 +1868,42 @@ class ChatGPTBrowser:
             Exception: An owned resource could not be shut down cleanly.
         """
         self._abandon_start = True
-        self._home_page = None
-        self._home_navigated_at = None
-        self._bootstrap_pages = []
-        self._launch_blank_pages = ()
         try:
             try:
                 if self.context is not None:
-                    context, self.context = self.context, None
+                    context = self.context
                     await asyncio.wait_for(context.close(), CLOSE_TIMEOUT_SECONDS / 2)
+                    if self.context is context:
+                        self.context = None
             finally:
                 if self._startup_task is not None:
                     # Shield the handshake; a late result closes itself. On a
                     # timeout retain the task so close() can observe it again.
-                    self._driver = await asyncio.wait_for(
-                        asyncio.shield(self._startup_task), CLOSE_TIMEOUT_SECONDS / 2
-                    )
+                    try:
+                        late_driver = await asyncio.wait_for(
+                            asyncio.shield(self._startup_task),
+                            CLOSE_TIMEOUT_SECONDS / 2,
+                        )
+                    except BaseException:
+                        if self._startup_task.done():
+                            self._startup_task = None
+                        raise
                     self._startup_task = None
+                    if late_driver is not None:
+                        self._driver = late_driver
                 if self._driver is not None:
-                    driver, self._driver = self._driver, None
+                    driver = self._driver
                     await asyncio.wait_for(driver.stop(), CLOSE_TIMEOUT_SECONDS / 2)
+                    if self._driver is driver:
+                        self._driver = None
         except BaseException:
+            self._release_failed = True
             self.status = BrowserStatus.PAUSED
             self.pause_reason = "cleanup"
             raise
+        self._home_page = None
+        self._home_navigated_at = None
+        self._bootstrap_pages = []
+        self._launch_blank_pages = ()
         self.status = BrowserStatus.PAUSED
         self.pause_reason = "browser"
