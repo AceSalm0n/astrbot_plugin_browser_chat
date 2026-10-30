@@ -245,6 +245,7 @@ class ChatGPTBrowser:
         self._home_page = None
         self._home_navigated_at = None
         self._bootstrap_pages = []
+        self._launch_blank_pages = ()
         self._home_key = object()
         self._check_key = object()
         self._closing = False
@@ -320,6 +321,7 @@ class ChatGPTBrowser:
                             self._bootstrap_pages.append(page)
                     except Exception:
                         continue
+                self._launch_blank_pages = tuple(self._bootstrap_pages)
                 if self.start_minimized and os.name == "nt" and self.context.pages:
                     self._window_generation += 1
                     await self._window_call(
@@ -410,6 +412,40 @@ class ChatGPTBrowser:
             self._closing_requests.clear()
 
     @property
+    def idle_eligible(self) -> bool:
+        """Read-only proof that release cannot interrupt work or manual pages."""
+        if (
+            self.context is None
+            or self.status != BrowserStatus.READY
+            or self._closing
+            or self._resuming
+            or self._window_manual
+            or self.cleanup_problem
+            or self._maintenance_task is not None
+            or self._asks
+            or self._pending_saves
+            or self._save_waiters
+            or (self._writer is not None and not self._writer.done())
+        ):
+            return False
+        try:
+            for page in self.context.pages:
+                if page.is_closed():
+                    continue
+                if page is self._home_page and page.url == self.base_url:
+                    continue
+                if (
+                    page is not self._home_page
+                    and any(page is blank for blank in self._launch_blank_pages)
+                    and page.url == "about:blank"
+                ):
+                    continue
+                return False
+        except Exception:
+            return False
+        return True
+
+    @property
     def window_status(self):
         """Return a safe, fixed-code snapshot of optional window control."""
         if not self.start_minimized or os.name != "nt":
@@ -433,7 +469,9 @@ class ChatGPTBrowser:
             self._window_disabled_reason = reason
         if not self._window_warned:
             self._window_warned = True
-            logger.warning("Optional browser window control degraded: reason=%s", reason)
+            logger.warning(
+                "Optional browser window control degraded: reason=%s", reason
+            )
 
     def _window_done(self, task):
         """Release a tracked control job and observe any late exception."""
@@ -1820,6 +1858,7 @@ class ChatGPTBrowser:
         self._home_page = None
         self._home_navigated_at = None
         self._bootstrap_pages = []
+        self._launch_blank_pages = ()
         try:
             try:
                 if self.context is not None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import math
 import re
+import time
 from collections.abc import Mapping
 from types import SimpleNamespace
 from uuid import uuid4
@@ -58,6 +59,7 @@ COMMAND_PATTERN = (
     r"cleanup (?:(?:check|retry) [A-Za-z0-9_-]{1,200}|resolve [A-Za-z0-9_-]{1,200} 已核对))\Z"
 )
 READINESS_TIMEOUT_SECONDS = 60
+IDLE_CHECK_MAX_SECONDS = 30
 STARTUP_BINDING_RETRY_DELAYS = (1, 2, 4, 8, 15, 60)
 DEFAULT_CONFIG = {
     "website_provider": "chatgpt",
@@ -81,6 +83,7 @@ DEFAULT_CONFIG = {
     "browser_channel": "chrome",
     "browser_profile_name": "",
     "browser_start_minimized": False,
+    "browser_idle_timeout_seconds": 0,
 }
 
 
@@ -149,6 +152,13 @@ def validate_config(config: Mapping) -> dict:
             valid = False
         if not valid:
             raise ConfigError(key)
+    value = result["browser_idle_timeout_seconds"]
+    try:
+        valid = type(value) is int and value >= 0 and math.isfinite(value)
+    except OverflowError:
+        valid = False
+    if not valid:
+        raise ConfigError("browser_idle_timeout_seconds")
     try:
         split_answer("", result["max_reply_chars"], result["forward_node_chars"])
     except ValueError:
@@ -194,6 +204,12 @@ class BrowserChatPlugin(Star):
         self._initialized = False
         self._closing = False
         self._terminate_task = None
+        self._idle_task = None
+        self._idle_stop = asyncio.Event()
+        self._idle_released = False
+        self._idle_wake_failure = None
+        self._last_activity = time.monotonic()
+        self._pause_generation = 0
 
     async def initialize(self) -> None:
         """Create resources once; failed configuration/login stays diagnosably paused."""
@@ -240,10 +256,116 @@ class BrowserChatPlugin(Star):
             reason = "config" if self.config_error else await self._ensure_ready()
             if reason is None and not self._closing:
                 await self.manager.resume()
+                self._start_idle_monitor()
             else:
                 await self.manager.pause(reason or "closed")
             if reason is not None:
                 self._publish_startup_fault(reason)
+
+    def _start_idle_monitor(self):
+        """Refresh activity and own at most one optional sleeping monitor."""
+        self._last_activity = time.monotonic()
+        if (
+            not self._closing
+            and self.settings["browser_idle_timeout_seconds"] > 0
+            and (self._idle_task is None or self._idle_task.done())
+        ):
+            self._idle_task = asyncio.create_task(self._monitor_idle())
+
+    async def _monitor_idle(self):
+        """Sleep between checks; shutdown signals and joins rather than cancels."""
+        interval = min(
+            self.settings["browser_idle_timeout_seconds"], IDLE_CHECK_MAX_SECONDS
+        )
+        while not self._idle_stop.is_set():
+            try:
+                await asyncio.wait_for(self._idle_stop.wait(), interval)
+                return
+            except asyncio.TimeoutError:
+                await self._release_if_idle()
+
+    async def _release_if_idle(self):
+        """Release only a drained, ready browser under the shared lifecycle lock."""
+        async with self._lifecycle:
+            if (
+                self._closing
+                or self.config_error
+                or not self.settings
+                or not self.settings["browser_idle_timeout_seconds"]
+                or self._idle_released
+                or time.monotonic() - self._last_activity
+                < self.settings["browser_idle_timeout_seconds"]
+                or self.manager is None
+                or self.browser is None
+            ):
+                return
+            state = self.manager.snapshot()
+            if (
+                state.state != ManagerState.RUNNING
+                or state.running
+                or state.queued
+                or self.browser.context is None
+                or not self.browser.idle_eligible
+            ):
+                return
+            pause_generation = self._pause_generation
+            try:
+                await self.browser.close()
+            except Exception as error:
+                self.logger.warning(
+                    "Idle browser release failed: type=%s", type(error).__name__
+                )
+                await self.manager.pause("cleanup")
+                self._publish_startup_fault("cleanup")
+                return
+            state = self.manager.snapshot()
+            window = self.browser.window_status
+            if (
+                not self._closing
+                and pause_generation == self._pause_generation
+                and state.state == ManagerState.RUNNING
+                and window["mode"] != "manual"
+            ):
+                self._idle_released = True
+
+    async def _generate(self, job):
+        """Serialize optional wake, then submit once within the generation budget.
+
+        Args:
+            job: Scheduler-owned job; cancellation joins wake resource cleanup.
+        """
+        async with self._lifecycle:
+            if (
+                self._closing
+                or job.cancel_requested
+                or self.manager.snapshot().state != ManagerState.RUNNING
+            ):
+                raise asyncio.CancelledError
+            if self._idle_wake_failure is not None:
+                raise BrowserError(self._idle_wake_failure)
+            if self._idle_released:
+                try:
+                    reason = await self._ensure_ready()
+                except asyncio.CancelledError:
+                    await self.browser.close()
+                    raise
+                if (
+                    self._closing
+                    or job.cancel_requested
+                    or self.manager.snapshot().state != ManagerState.RUNNING
+                ):
+                    await self.browser.close()
+                    raise asyncio.CancelledError
+                if reason is not None:
+                    self._idle_wake_failure = reason
+                    raise BrowserError(reason)
+                self._idle_released = False
+        return await self.browser.ask(
+            job.task_id,
+            job.prompt,
+            job.config["execution_timeout_seconds"],
+            keep=job.config["keep_conversations"],
+        )
 
     def _publish_startup_fault(self, reason):
         """Keep late platform notices aligned with the latest readiness fault."""
@@ -461,7 +583,14 @@ class BrowserChatPlugin(Star):
                 event,
                 "BrowserChat（{}）：{}；执行 {}；等待 {}；原因 {}。".format(
                     settings["website_provider"],
-                    state.state.value if state else "starting",
+                    (state.state.value if state else "starting")
+                    + (
+                        "/idle"
+                        if self._idle_released
+                        and self.browser is not None
+                        and self.browser.context is None
+                        else ""
+                    ),
                     state.running if state else 0,
                     state.queued if state else 0,
                     reason or "ready",
@@ -476,11 +605,17 @@ class BrowserChatPlugin(Star):
             await self._reply(event, "服务未就绪，请管理员检查配置并重载本插件。")
             return
         if command == "pause":
+            self._pause_generation += 1
+            state = self.manager.snapshot()
+            if self.browser is not None:
+                self.browser.take_manual_control()
+            pause_reason = (
+                state.pause_reason
+                if state.pause_reason not in ("starting", "resuming")
+                else "manual"
+            )
+            await self.manager.pause(pause_reason or "manual")
             async with self._lifecycle:
-                state = self.manager.snapshot()
-                if self.browser is not None:
-                    self.browser.take_manual_control()
-                await self.manager.pause(state.pause_reason or "manual")
                 await self.manager.wait_until_idle()
                 if self.browser and self.browser.cleanup_problem:
                     await self.manager.pause("cleanup")
@@ -576,6 +711,7 @@ class BrowserChatPlugin(Star):
             return
         if command == "resume":
             async with self._lifecycle:
+                pause_generation = self._pause_generation
                 state = self.manager.snapshot()
                 if (
                     self._closing
@@ -586,8 +722,22 @@ class BrowserChatPlugin(Star):
                     return
                 await self.manager.pause("resuming")
                 reason = await self._ensure_ready()
+                if reason is None:
+                    self._idle_released = False
+                    self._idle_wake_failure = None
+                if (
+                    reason is None
+                    and not self._closing
+                    and pause_generation != self._pause_generation
+                ):
+                    if self.browser is not None:
+                        self.browser.take_manual_control()
+                    await self.manager.pause("manual")
+                    await self._reply(event, "恢复已取消；服务保持暂停。")
+                    return
                 if reason is None and not self._closing:
                     await self.manager.resume()
+                    self._start_idle_monitor()
                     self._startup_fault = None
                     if self._startup_binding_task:
                         self._startup_binding_task.cancel()
@@ -710,6 +860,7 @@ class BrowserChatPlugin(Star):
                 ),
             )
             return
+        self._last_activity = time.monotonic()
         watcher = asyncio.create_task(self._watch(admission.task_id, route, settings))
         self._watchers.add(watcher)
         watcher.add_done_callback(self._watchers.discard)
@@ -748,14 +899,7 @@ class BrowserChatPlugin(Star):
         try:
             if job.cancel_requested or self._closing:
                 raise asyncio.CancelledError
-            generation = asyncio.create_task(
-                self.browser.ask(
-                    job.task_id,
-                    job.prompt,
-                    job.config["execution_timeout_seconds"],
-                    keep=job.config["keep_conversations"],
-                )
-            )
+            generation = asyncio.create_task(self._generate(job))
             try:
                 done, _ = await asyncio.wait(
                     {generation}, timeout=job.config["execution_timeout_seconds"]
@@ -822,6 +966,7 @@ class BrowserChatPlugin(Star):
                 await self.manager.pause("cleanup")
             elif self.browser.status == BrowserStatus.PAUSED:
                 await self.manager.pause(self.browser.pause_reason or "browser")
+            self._last_activity = time.monotonic()
 
     async def _watch(self, task_id, route, settings):
         """Report one terminal outcome, including jobs that never entered a runner."""
@@ -872,11 +1017,16 @@ class BrowserChatPlugin(Star):
     async def terminate(self) -> None:
         """Join owned work on unload; concurrent calls share the same shutdown."""
         self._closing = True
+        self._idle_stop.set()
         if self._terminate_task is None:
             self._terminate_task = asyncio.create_task(self._terminate_owned())
         await asyncio.shield(self._terminate_task)
 
     async def _terminate_owned(self):
+        if self.manager:
+            await self.manager.close()
+        if self._idle_task:
+            await asyncio.gather(self._idle_task, return_exceptions=True)
         async with self._lifecycle:
             try:
                 self._startup_fault = None
