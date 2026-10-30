@@ -1205,8 +1205,7 @@ class ChatGPTBrowser:
                     != prompt.replace("\r\n", "\n").strip()
                 ):
                     raise BrowserError("submission_unknown", submission_unknown=True)
-                record["submission"] = "confirmed"
-                await self._save_records()
+                await self._confirm_submission(record, page.url)
             conversation_pending = False
             if record["submission"] == "confirmed":
                 # URL changes alone cannot establish that this task owns a chat.
@@ -1304,8 +1303,7 @@ class ChatGPTBrowser:
             snapshot = await self._site.inspect_turn(page, prompt, users, answers)
             if snapshot.submission_confirmed:
                 if record["submission"] != "confirmed":
-                    record["submission"] = "confirmed"
-                    await self._save_records()
+                    await self._confirm_submission(record, page.url)
                 await self._capture_conversation(record, page.url)
             # Default cleanup needs a canonical owned URL; some sites assign it
             # after the final text is already visible.
@@ -1318,6 +1316,16 @@ class ChatGPTBrowser:
             else:
                 stable_text, stable_since = None, None
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
+
+    async def _confirm_submission(self, record, url):
+        """Persist confirmation with an already-known canonical owner atomically."""
+        previous_id = record["conversation_id"]
+        record["submission"] = "confirmed"
+        await self._capture_conversation(record, url)
+        if record["conversation_id"] == previous_id:
+            # Home and temporary URLs still require durable confirmation, while
+            # a newly captured canonical ID was saved with confirmation above.
+            await self._save_records()
 
     async def _capture_conversation(self, record, url):
         """Capture a canonical URL only after the caller confirms its own prompt.
