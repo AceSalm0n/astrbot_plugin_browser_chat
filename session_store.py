@@ -18,7 +18,18 @@ class StoreError(RuntimeError):
 
 
 def validate_payload(payload, conversation_url):
-    """Validate the exact active/archive schema and migrate detached v1 records."""
+    """Validate active or archived metadata and migrate detached v1 records.
+
+    Args:
+        payload: Decoded registry object; v1 sessions are migrated in place.
+        conversation_url: Adapter function deriving the canonical session URL.
+
+    Returns:
+        Validated session mapping with v2 fields on every record.
+
+    Raises:
+        ValueError: The schema, field values, or session URL is invalid.
+    """
     if (
         not isinstance(payload, dict)
         or set(payload) != {"version", "sessions"}
@@ -155,6 +166,17 @@ class SessionStore:
         self.conversation_url = conversation_url
 
     def _checked(self, path):
+        """Require a registry or archive target within its owned namespace.
+
+        Args:
+            path: Metadata path to resolve before an actual file operation.
+
+        Returns:
+            The original path after its resolved destination is checked.
+
+        Raises:
+            StoreError: The path escapes or cannot be safely resolved.
+        """
         is_archive = path.parent == self.archive
         try:
             resolved = path.resolve()
@@ -221,6 +243,16 @@ class SessionStore:
         return records[task_id]
 
     def _atomic(self, path, payload):
+        """Replace one metadata file after flushing its temporary copy.
+
+        Args:
+            path: Checked destination within the owned data directory.
+            payload: JSON-serializable metadata to write.
+
+        Raises:
+            StoreError: The destination path is unsafe.
+            OSError: Creating, flushing, or replacing the file fails.
+        """
         temporary = None
         try:
             self._checked(path)
