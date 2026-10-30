@@ -452,6 +452,11 @@ class BrowserChatPlugin(Star):
         if command == "status":
             state = self.manager.snapshot() if self.manager else None
             reason = self.config_error or (state.pause_reason if state else "starting")
+            window = (
+                self.browser.window_status
+                if self.browser is not None
+                else {"mode": "off", "reason": None}
+            )
             await self._reply(
                 event,
                 "BrowserChat（{}）：{}；执行 {}；等待 {}；原因 {}。".format(
@@ -460,6 +465,9 @@ class BrowserChatPlugin(Star):
                     state.running if state else 0,
                     state.queued if state else 0,
                     reason or "ready",
+                )
+                + "\n窗口控制：{}；诊断 {}。".format(
+                    window["mode"], window["reason"] or "none"
                 )
                 + ("\n" + self._cleanup_summary() if reason == "cleanup" else ""),
             )
@@ -470,6 +478,8 @@ class BrowserChatPlugin(Star):
         if command == "pause":
             async with self._lifecycle:
                 state = self.manager.snapshot()
+                if self.browser is not None:
+                    self.browser.take_manual_control()
                 await self.manager.pause(state.pause_reason or "manual")
                 await self.manager.wait_until_idle()
                 if self.browser and self.browser.cleanup_problem:

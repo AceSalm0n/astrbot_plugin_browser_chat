@@ -230,6 +230,8 @@ class ChatGPTBrowser:
         self._window_generation = 0
         self._window_jobs = set()
         self._window_warned = False
+        self._window_disabled_reason = None
+        self._window_manual = False
         self.status = BrowserStatus.PAUSED
         self.pause_reason = "config"
         self.context: BrowserContext | None = None
@@ -407,11 +409,31 @@ class ChatGPTBrowser:
             self._closing = False
             self._closing_requests.clear()
 
-    def _window_warning(self):
-        """Report optional UI degradation once without changing business status."""
+    @property
+    def window_status(self):
+        """Return a safe, fixed-code snapshot of optional window control."""
+        if not self.start_minimized or os.name != "nt":
+            mode = "off"
+        elif self._window_manual:
+            mode = "manual"
+        elif self._window_disabled_reason:
+            mode = "degraded"
+        else:
+            mode = "best_effort"
+        return {"mode": mode, "reason": self._window_disabled_reason}
+
+    def take_manual_control(self):
+        """Invalidate pending display writes before the caller awaits cleanup."""
+        self._window_manual = True
+        self._window_generation += 1
+
+    def _window_warning(self, reason):
+        """Record the first safe failure code and deduplicate its warning."""
+        if self._window_disabled_reason is None:
+            self._window_disabled_reason = reason
         if not self._window_warned:
             self._window_warned = True
-            logger.warning("Optional browser window control unavailable")
+            logger.warning("Optional browser window control degraded: reason=%s", reason)
 
     def _window_done(self, task):
         """Release a tracked control job and observe any late exception."""
@@ -419,7 +441,7 @@ class ChatGPTBrowser:
         if not task.cancelled():
             task.exception()
 
-    async def _window_rpc(self, page, token, minimize, expected_id):
+    async def _window_rpc(self, page, token, minimize, expected_id, diagnostic):
         """Inspect or minimize exactly one owned target's browser window.
 
         Args:
@@ -435,8 +457,10 @@ class ChatGPTBrowser:
         attach = asyncio.create_task(self.context.new_cdp_session(page))
         self._window_jobs.add(attach)
         attach.add_done_callback(self._window_done)
+        diagnostic["phase"] = "attach"
         try:
             session = await asyncio.shield(attach)
+            diagnostic["phase"] = "read"
             result = await session.send("Browser.getWindowForTarget")
             window_id = result["windowId"]
             state = result["bounds"]["windowState"]
@@ -451,17 +475,21 @@ class ChatGPTBrowser:
                 minimize
                 and (expected_id is None or expected_id == window_id)
                 and token == self._window_generation
-                and not self._window_warned
+                and not self._window_manual
+                and not self._window_disabled_reason
                 and not self._closing
                 and state != "minimized"
             ):
+                diagnostic["phase"] = "minimize"
                 await session.send(
                     "Browser.setWindowBounds",
                     {"windowId": window_id, "bounds": {"windowState": "minimized"}},
                 )
             return window_id, state
+        except asyncio.CancelledError:
+            raise
         except Exception:
-            self._window_warning()
+            self._window_warning(f"{diagnostic['phase']}_failed")
             return None
         finally:
             if session is None and not attach.cancelled():
@@ -470,10 +498,11 @@ class ChatGPTBrowser:
                 except Exception:
                     pass
             if session is not None:
+                diagnostic["phase"] = "detach"
                 try:
                     await session.detach()
                 except Exception:
-                    self._window_warning()
+                    self._window_warning("detach_failed")
 
     async def _window_call(
         self, page, budget, token, *, minimize=False, expected_id=None
@@ -490,16 +519,19 @@ class ChatGPTBrowser:
         Returns:
             A window snapshot, or None. Caller cancellation propagates.
         """
-        if budget <= 0:
+        if budget <= 0 or self._window_manual or self._window_disabled_reason:
             return None
-        task = asyncio.create_task(self._window_rpc(page, token, minimize, expected_id))
+        diagnostic = {"phase": "attach"}
+        task = asyncio.create_task(
+            self._window_rpc(page, token, minimize, expected_id, diagnostic)
+        )
         self._window_jobs.add(task)
         task.add_done_callback(self._window_done)
         try:
             done, _ = await asyncio.wait((task,), timeout=budget)
             if done:
                 return task.result()
-            self._window_warning()
+            self._window_warning(f"budget_timeout_{diagnostic['phase']}")
         except asyncio.CancelledError:
             raise
         finally:
@@ -527,7 +559,8 @@ class ChatGPTBrowser:
         enabled = (
             self.start_minimized
             and os.name == "nt"
-            and not self._window_warned
+            and not self._window_manual
+            and not self._window_disabled_reason
             and budget > 0
         )
         coordinated = False
@@ -551,7 +584,8 @@ class ChatGPTBrowser:
             if (
                 snapshot
                 and snapshot[1] == "minimized"
-                and not self._window_warned
+                and not self._window_manual
+                and not self._window_disabled_reason
                 and token == self._window_generation
             ):
                 await self._window_call(
@@ -751,6 +785,9 @@ class ChatGPTBrowser:
                     return self.status
                 self.status = BrowserStatus.READY
                 self.pause_reason = None
+                if self._window_manual:
+                    self._window_manual = False
+                    self._window_generation += 1
                 return self.status
         finally:
             self._resuming = False
