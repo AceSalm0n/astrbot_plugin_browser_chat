@@ -347,7 +347,24 @@ class BrowserChatPlugin(Star):
                 try:
                     reason = await self._ensure_ready()
                 except asyncio.CancelledError:
-                    await self.browser.close()
+                    outer_timeout = (
+                        not job.cancel_requested
+                        and not self._closing
+                        and self.manager.snapshot().state == ManagerState.RUNNING
+                    )
+                    if outer_timeout:
+                        self._idle_wake_failure = "timeout"
+                    try:
+                        await self.browser.close()
+                    except Exception as error:
+                        if outer_timeout:
+                            self._idle_wake_failure = "cleanup"
+                            self.logger.warning(
+                                "Timed-out idle wake close failed: type=%s",
+                                type(error).__name__,
+                            )
+                            self._publish_startup_fault("cleanup")
+                        raise
                     raise
                 if (
                     self._closing
@@ -935,6 +952,11 @@ class BrowserChatPlugin(Star):
             raise
         except asyncio.TimeoutError:
             job.result, job.reason = JobResult.TIMED_OUT, "timeout"
+            if (
+                self._idle_wake_failure == "cleanup"
+                and self.manager.snapshot().state == ManagerState.RUNNING
+            ):
+                await self.manager.pause("cleanup")
         except BrowserError as error:
             if error.site_category:
                 self._site_faults[job.task_id] = error.site_category
